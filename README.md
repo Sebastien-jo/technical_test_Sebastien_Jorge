@@ -4,32 +4,121 @@
 [![Main Merge](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/main-merge.yml/badge.svg)](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/main-merge.yml)
 [![Nightly Endurance](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/schedule-extended-tests.yml/badge.svg)](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/schedule-extended-tests.yml)
 
-A production-ready HTTP rate limiting service built in Go with Redis storage and an in-memory fallback.
+A production-ready HTTP rate limiting service built in Go. It enforces per-client, per-route quotas using a **Token Bucket** algorithm, backed by **Redis** with an **in-memory fallback** that activates automatically when Redis is unavailable.
+
+---
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Algorithm](#algorithm)
+- [Storage](#storage)
+- [API Reference](#api-reference)
+  - [POST /check](#post-check)
+  - [GET /policies](#get-policies)
+  - [GET /policies/:client\_id](#get-policiesclient_id)
+  - [GET /health](#get-health)
+- [Common Headers](#common-headers)
+- [Configuration](#configuration)
+- [Quick Start](#quick-start)
+- [Testing](#testing)
+- [CI/CD Pipeline](#cicd-pipeline)
+- [Troubleshooting](#troubleshooting)
+
+---
 
 ## Architecture
 
+The service is structured in strict layers, each with a single responsibility and no knowledge of the layers above it.
+
+- **Handler** — parses HTTP requests, validates input, writes responses, and sets headers. It has no rate-limiting logic; it delegates everything to the layers below.
+- **Service** — contains all business logic: policy matching (which rule applies to this request?) and the Token Bucket algorithm (is this request within quota?). It is framework-agnostic and has no HTTP or storage concerns.
+- **Storage** — abstracts state persistence behind a simple interface. The concrete implementation is a hybrid store that writes to Redis and falls back to memory automatically when Redis is unavailable.
+- **Models** — shared domain types (`RoutePolicy`, `ClientPolicy`, `Decision`) and sentinel errors used across all layers. No framework dependencies.
+- **Config** — loads and deserializes `config.yaml` into domain types at startup, then hands them to the service layer. It is only used at boot time.
+
+### Request Flow
+
 ```
-cmd/         — entrypoint, wires all layers
-internal/
-  config/           — Viper config loading, policy deserialization
-  models/           — domain types (no framework dependencies)
-  service/          — Token Bucket algorithm, policy matching
-  storage/          — Redis + in-memory backends, hybrid fallback
-  handler/          — HTTP handlers and middleware (Gin)
-tests/              — integration tests + K6 load test scripts
-scripts/            — helper shell scripts
+HTTP Request
+    │
+    ▼
+Middleware (RequestID, Logger)
+    │
+    ▼
+Handler (parse + validate JSON body)
+    │
+    ▼
+PolicyMatcher.FindPolicy(client_id, route, method)
+    │  ├─ exact match (highest priority)
+    │  └─ longest prefix match
+    │
+    ▼
+RateLimiter.Check(client_id, route_policy, identifier)
+    │  └─ TokenBucket.Allow()  ← gets/creates bucket in Store
+    │
+    ▼
+Response (200 allowed | 429 limited) + RateLimit headers
 ```
 
-## Endpoints
+---
 
-| Method | Path                    | Description                              |
-|--------|-------------------------|------------------------------------------|
-| POST   | /check                  | Check if a request is within quota       |
-| GET    | /policies               | List all configured client IDs           |
-| GET    | /policies/:client_id    | Inspect routes and limits for one client |
-| GET    | /health                 | Storage health check                     |
+## Algorithm
+
+The service uses a **Token Bucket** algorithm with continuous (smooth) refill rather than fixed windows.
+
+- Each bucket starts full at capacity `limit`.
+- Tokens refill at a constant rate of `limit / window` tokens per second.
+- A request consumes one token. If the bucket is empty the request is denied and the wait time until one token is available is returned as `retry_after`.
+- Buckets are scoped by a composite storage key: `{client_id}:{route}:{method}:{identifier}`.
+
+This approach avoids the burst-at-boundary problem of fixed windows and allows short bursts up to the configured limit.
+
+---
+
+## Storage
+
+### Hybrid Store
+
+The `HybridStore` wraps both a Redis store and an in-memory store with automatic failover:
+
+1. **Normal operation** — all reads/writes go to Redis, enabling shared state across multiple service instances.
+2. **Redis failure** — on any Redis error, the store transparently switches to in-memory and starts a background reconnect loop that retries every 10 seconds.
+3. **Redis recovery** — once Redis is reachable again the store switches back automatically; no restart required.
+
+The `/health` endpoint reflects the current storage status.
+
+---
+
+## API Reference
+
+Base URL: `http://localhost:8080`
+
+All requests and responses use `application/json`. Every response includes a `X-Trace-ID` header for distributed tracing.
+
+---
 
 ### POST /check
+
+Evaluates whether a request from a given client is within its configured quota for the matched route. This is the core endpoint that your API gateway or middleware calls on every inbound request.
+
+#### Request
+
+```
+POST /check
+Content-Type: application/json
+```
+
+| Field        | Type   | Required | Description                                                  |
+|--------------|--------|----------|--------------------------------------------------------------|
+| `client_id`  | string | **yes**  | Identifies the API client (must match a configured policy)   |
+| `route`      | string | **yes**  | The request path (e.g. `/api/videos/123`)                    |
+| `method`     | string | **yes**  | HTTP method of the original request (e.g. `GET`, `POST`)     |
+| `session_id` | string | no       | Session token; used when the policy identifier is `session_id` |
+| `ip`         | string | no       | Client IP; used when the policy identifier is `ip` or `ip_user_agent` |
+| `user_agent` | string | no       | User-Agent string; used when the policy identifier is `ip_user_agent` |
+
+**Example request:**
 
 ```json
 {
@@ -38,42 +127,269 @@ scripts/            — helper shell scripts
   "method":     "GET",
   "session_id": "user-session-abc",
   "ip":         "1.2.3.4",
-  "user_agent": "Mozilla/5.0"
+  "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)"
 }
 ```
 
-Response `200`:
+#### Responses
+
+**`200 OK` — request is within quota**
+
 ```json
-{ "allowed": true, "remaining": 99, "reset_time": 1700000060 }
+{
+  "allowed":    true,
+  "remaining":  99,
+  "reset_time": 1700000060
+}
 ```
 
-Response `429`:
+| Field        | Type    | Description                                              |
+|--------------|---------|----------------------------------------------------------|
+| `allowed`    | boolean | Always `true` for 200 responses                          |
+| `remaining`  | integer | Number of tokens remaining in the current bucket         |
+| `reset_time` | integer | Unix timestamp (seconds) when the bucket will be full    |
+
+---
+
+**`429 Too Many Requests` — quota exceeded**
+
 ```json
-{ "allowed": false, "remaining": 0, "retry_after": 12, "message": "rate limit exceeded" }
+{
+  "allowed":     false,
+  "remaining":   0,
+  "reset_time":  1700000060,
+  "retry_after": 12,
+  "message":     "rate limit exceeded"
+}
 ```
 
-Rate-limit headers are set on every response:
-- `X-RateLimit-Limit` — configured limit for the matched route
-- `X-RateLimit-Remaining` — tokens left in the current window
-- `X-RateLimit-Reset` — Unix timestamp when the bucket refills
-- `Retry-After` — seconds to wait (429 only)
+| Field         | Type    | Description                                              |
+|---------------|---------|----------------------------------------------------------|
+| `allowed`     | boolean | Always `false` for 429 responses                         |
+| `remaining`   | integer | Always `0` when the quota is exhausted                   |
+| `reset_time`  | integer | Unix timestamp (seconds) when the bucket will be full    |
+| `retry_after` | integer | Seconds to wait before retrying                          |
+| `message`     | string  | Human-readable reason                                    |
 
-## Quick Start
+---
 
-```bash
-docker compose up --build
+**`400 Bad Request` — missing or invalid fields**
+
+```json
+{ "error": "Key: 'CheckRequest.ClientID' Error:Field validation for 'ClientID' failed on the 'required' tag" }
 ```
 
-The server starts on port `8080`. Redis starts automatically.
+**`404 Not Found` — unknown client or route**
+
+```json
+{ "error": "client not found" }
+```
+
+```json
+{ "error": "route not found" }
+```
+
+**`500 Internal Server Error`**
+
+```json
+{ "error": "internal error" }
+```
+
+---
+
+### GET /policies
+
+Returns the list of all configured client IDs.
+
+#### Request
+
+```
+GET /policies
+```
+
+No body, no parameters.
+
+#### Response
+
+**`200 OK`**
+
+```json
+{
+  "clients": ["mobile_app", "web_app", "partner_api"]
+}
+```
+
+| Field     | Type            | Description                      |
+|-----------|-----------------|----------------------------------|
+| `clients` | array of string | All client IDs with active policies |
+
+---
+
+### GET /policies/:client_id
+
+Returns the full rate-limit configuration for a specific client, including every route rule.
+
+#### Request
+
+```
+GET /policies/mobile_app
+```
+
+| Parameter   | Location | Description          |
+|-------------|----------|----------------------|
+| `client_id` | path     | The client to inspect |
+
+#### Response
+
+**`200 OK`**
+
+```json
+{
+  "client_id": "mobile_app",
+  "routes": [
+    {
+      "route":      "/api/videos",
+      "route_type": "prefix",
+      "method":     "*",
+      "limit":      100,
+      "window":     "1m0s",
+      "identifier": "session_id"
+    },
+    {
+      "route":      "/api/upload",
+      "route_type": "exact",
+      "method":     "POST",
+      "limit":      10,
+      "window":     "1h0m0s",
+      "identifier": "ip"
+    }
+  ]
+}
+```
+
+| Field       | Type            | Description                                          |
+|-------------|-----------------|------------------------------------------------------|
+| `client_id` | string          | The client ID                                        |
+| `routes`    | array of object | One entry per configured route rule (see table below) |
+
+**Route object fields:**
+
+| Field        | Type    | Description                                                       |
+|--------------|---------|-------------------------------------------------------------------|
+| `route`      | string  | The path pattern                                                  |
+| `route_type` | string  | `"exact"` or `"prefix"` (see [Route Matching](#route-matching))   |
+| `method`     | string  | HTTP method or `"*"` for any method                               |
+| `limit`      | integer | Maximum number of requests allowed per window                     |
+| `window`     | string  | Time window as a Go duration string (e.g. `"1m0s"`, `"1h0m0s"`)  |
+| `identifier` | string  | Bucket scoping strategy (see [Identifier Types](#identifier-types)) |
+
+**`404 Not Found`**
+
+```json
+{ "error": "client not found" }
+```
+
+---
+
+### GET /health
+
+Checks whether the service and its storage backend are healthy. Suitable for load-balancer health checks and liveness probes.
+
+#### Request
+
+```
+GET /health
+```
+
+No body, no parameters.
+
+#### Responses
+
+**`200 OK` — service is healthy**
+
+```json
+{
+  "status":  "ok",
+  "storage": "ok"
+}
+```
+
+**`503 Service Unavailable` — storage is degraded**
+
+```json
+{
+  "status":  "degraded",
+  "storage": "degraded"
+}
+```
+
+> **Note:** A `degraded` storage response means Redis is unreachable. The service continues operating using the in-memory fallback. Existing rate-limit state is preserved in memory, but will not be shared across multiple instances until Redis recovers.
+
+| Field     | Type   | Values              | Description                   |
+|-----------|--------|---------------------|-------------------------------|
+| `status`  | string | `"ok"`, `"degraded"` | Overall service health        |
+| `storage` | string | `"ok"`, `"degraded"` | Storage backend health        |
+
+---
+
+## Common Headers
+
+### Request Headers
+
+| Header       | Description                                                         |
+|--------------|---------------------------------------------------------------------|
+| `X-Trace-ID` | Optional. If provided, echoed back and used as the request trace ID |
+
+### Response Headers (all endpoints)
+
+| Header             | Description                                                 |
+|--------------------|-------------------------------------------------------------|
+| `X-Trace-ID`       | Trace ID for this request (generated UUID v4 if not provided) |
+
+### Response Headers (`POST /check` only)
+
+| Header                | Description                                                   |
+|-----------------------|---------------------------------------------------------------|
+| `X-RateLimit-Limit`   | The configured quota for the matched route                    |
+| `X-RateLimit-Remaining` | Tokens remaining in the current bucket                      |
+| `X-RateLimit-Reset`   | Unix timestamp (seconds) when the bucket will be full         |
+| `Retry-After`         | Seconds to wait before retrying (present only on `429` responses) |
+
+---
+
+## Route Matching
+
+When `POST /check` is called, the service selects the most specific matching route from the client's policy:
+
+1. **Exact match** (`route_type: exact`) — the `route` field must equal the policy route exactly. Exact matches always take priority over prefix matches.
+2. **Prefix match** (`route_type: prefix`) — the `route` field must start with the policy route at a path boundary. `/api` matches `/api` and `/api/videos/123` but **not** `/apiv2`. When multiple prefix rules match, the longest prefix wins.
+3. **Method matching** — `"*"` matches any HTTP method. Otherwise the match is case-insensitive (e.g. `"get"` matches `"GET"`).
+
+If no rule matches, `POST /check` returns `404`.
+
+---
+
+## Identifier Types
+
+The `identifier` field on a route policy controls how requests are bucketed — i.e. whether a limit is shared or per-user:
+
+| Value           | Bucket key includes       | Use case                                                    |
+|-----------------|---------------------------|-------------------------------------------------------------|
+| `none`          | (nothing extra)           | One shared bucket for all callers of this client+route      |
+| `session_id`    | `session_id` from request | Per-authenticated-session quota                             |
+| `ip`            | `ip` from request         | Per-source-IP quota                                         |
+| `ip_user_agent` | `ip` + `user_agent`       | Per-device quota (stricter fingerprinting)                  |
+
+---
 
 ## Configuration
 
-Settings are loaded from `config.yaml` (overridable via environment variables).
+Settings are loaded from `config.yaml`. Any key can be overridden with an environment variable using the `SCREAMING_SNAKE_CASE` equivalent (e.g. `REDIS_HOST`, `SERVER_PORT`).
 
 ```yaml
 server:
-  port: "8080"
-  timeout: 30s
+  port: "8080"     # listening port
+  timeout: 30s     # graceful shutdown timeout
 
 redis:
   host: localhost
@@ -83,19 +399,72 @@ redis:
 policies:
   - client_id: mobile_app
     routes:
-      - route: /api/videos
-        route_type: prefix   # "exact" or "prefix"
-        method: "*"          # HTTP method or "*" for all
-        limit: 100
+      - route: /api/videos      # path pattern
+        route_type: prefix       # "exact" | "prefix"
+        method: "*"              # HTTP method or "*" for all
+        limit: 100               # requests allowed per window
+        window: 1m               # time window (Go duration: 30s, 5m, 1h, …)
+        identifier: session_id   # "none" | "session_id" | "ip" | "ip_user_agent"
+
+      - route: /api/upload
+        route_type: exact
+        method: POST
+        limit: 10
+        window: 1h
+        identifier: ip
+
+  - client_id: web_app
+    routes:
+      - route: /
+        route_type: prefix
+        method: "*"
+        limit: 500
         window: 1m
-        identifier: session_id  # "none" | "session_id" | "ip" | "ip_user_agent"
+        identifier: none
 ```
 
-Environment variable override example: `REDIS_HOST=my-redis SERVER_PORT=9090`.
+### Environment variable overrides
+
+| Variable      | Config key    | Example         |
+|---------------|---------------|-----------------|
+| `SERVER_PORT` | `server.port` | `SERVER_PORT=9090` |
+| `REDIS_HOST`  | `redis.host`  | `REDIS_HOST=my-redis` |
+| `REDIS_PORT`  | `redis.port`  | `REDIS_PORT=6380` |
+| `REDIS_DB`    | `redis.db`    | `REDIS_DB=1` |
+
+---
+
+## Quick Start
+
+**Prerequisites: Docker + Docker Compose. Nothing else.**
+
+```bash
+docker compose up --build
+```
+
+The service starts on port `8080`. Redis starts automatically.
+
+### Try it
+
+```bash
+# Check a request
+curl -s -X POST http://localhost:8080/check \
+  -H 'Content-Type: application/json' \
+  -d '{"client_id":"mobile_app","route":"/api/videos/1","method":"GET","session_id":"abc"}' | jq
+
+# List all clients
+curl -s http://localhost:8080/policies | jq
+
+# Inspect a client's routes
+curl -s http://localhost:8080/policies/mobile_app | jq
+
+# Health check
+curl -s http://localhost:8080/health | jq
+```
+
+---
 
 ## Testing
-
-**Prerequisites: Docker + Docker Compose only. Nothing else to install.**
 
 ### Option 1 — Make (recommended)
 
@@ -120,29 +489,31 @@ chmod +x scripts/run-tests.sh
 ### Option 3 — Docker Compose directly
 
 ```bash
-# Integration tests (self-contained, no app needed)
+# Integration tests (self-contained, no live server required)
 docker compose --profile test run --rm test
 
-# K6 load tests (starts app + redis automatically)
+# K6 load tests (starts app + Redis automatically)
 docker compose --profile load-test run --rm k6-load
 docker compose --profile load-test run --rm k6-spike
 docker compose --profile load-test run --rm k6-endurance
 ```
 
+---
+
 ## Test Suites
 
 ### Integration tests (`tests/integration_test.go`)
 
-Go end-to-end tests using `httptest` and in-memory storage — no live server required.
+Go end-to-end tests using `httptest` and in-memory storage — no live server or Redis required.
 
 Covers:
 - Basic allow / deny / retry-after flow
 - Quota isolation: by client, by route, by identifier (session / IP)
 - Route matching: exact, prefix, wildcard method, method case insensitivity
-- Input validation: missing fields, unknown client, unknown route
-- HTTP headers: `X-Request-ID`, `X-RateLimit-*`, `Retry-After`
-- Policies endpoint: list all clients, inspect routes per client
-- Health endpoint
+- Input validation: missing required fields, unknown client, unknown route
+- HTTP headers: `X-Trace-ID`, `X-RateLimit-*`, `Retry-After`
+- Policy endpoints: list all clients, inspect routes per client
+- Health endpoint: ok and degraded states
 - Exact quota exhaustion (11th request denied when limit=10)
 - Concurrent requests: 150 goroutines → exactly 100 allowed, 50 denied
 - Storage persistence across sequential requests
@@ -171,14 +542,16 @@ Sustained 50 req/s for 10 minutes to surface memory leaks and latency drift.
 
 Same strict thresholds as the normal load test (`p(95) < 500ms`).
 
-## Expected Results
+### Expected results
 
-| Test suite   | Duration | Expected outcome                       |
-|--------------|----------|----------------------------------------|
-| Integration  | ~5s      | 100% pass                              |
-| Load         | ~2min    | p95 < 500ms, <10% failures             |
-| Spike        | ~30s     | p99 < 2s, no panics                    |
-| Endurance    | ~11min   | Stable latency, no memory growth       |
+| Test suite  | Duration | Expected outcome                |
+|-------------|----------|---------------------------------|
+| Integration | ~5s      | 100% pass                       |
+| Load        | ~2min    | p95 < 500ms, <10% failures      |
+| Spike       | ~30s     | p99 < 2s, no panics             |
+| Endurance   | ~11min   | Stable latency, no memory growth |
+
+---
 
 ## CI/CD Pipeline
 
@@ -188,7 +561,7 @@ Same strict thresholds as the normal load test (`p(95) < 500ms`).
 |----------|---------|------|
 | **PR Checks** | Every pull request to `main` | lint, unit tests (race + coverage), integration tests, load + spike tests, gosec scan |
 | **Main Merge** | Push to `main` | All PR checks → Docker build → Trivy container scan → deployment smoke test |
-| **Nightly Endurance** | `cron: 0 2 * * *` (manual via `workflow_dispatch`) | K6 endurance test (~11 min) |
+| **Nightly Endurance** | `cron: 0 2 * * *` (or manual via `workflow_dispatch`) | K6 endurance test (~11 min) |
 
 ### PR Checks detail
 
@@ -222,6 +595,8 @@ make ci-all           # everything above in sequence
 
 [Dependabot](.github/dependabot.yml) opens weekly PRs to update Go modules and GitHub Actions pins. PRs are labelled `dependencies` and respect the standard PR check gate.
 
+---
+
 ## Troubleshooting
 
 **Port 8080 already in use**
@@ -230,6 +605,7 @@ make down   # or: docker compose down
 ```
 
 **K6 cannot reach the app**
+
 The K6 containers communicate via the `rate-limiter-net` bridge network using the hostname `app`. Make sure the app is running and healthy:
 ```bash
 docker compose ps
@@ -237,7 +613,9 @@ make health
 ```
 
 **Go test module download is slow on first run**
+
 The `go-cache` Docker volume caches downloaded modules. Subsequent runs are fast.
 
 **Redis not available at startup**
-The app automatically falls back to in-memory storage and retries Redis reconnection every 10 seconds.
+
+The app automatically falls back to in-memory storage and retries Redis reconnection every 10 seconds. The `/health` endpoint will report `"storage": "degraded"` while the fallback is active, but the service continues enforcing rate limits.
