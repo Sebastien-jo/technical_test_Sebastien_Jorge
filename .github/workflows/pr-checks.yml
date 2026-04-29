@@ -1,0 +1,100 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run unit tests with race detector
+        run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./internal/...
+
+      - name: Enforce 80% coverage threshold
+        run: |
+          go tool cover -func=coverage.out | grep total | awk '{
+            cov = $3
+            gsub(/%/, "", cov)
+            if (cov + 0 < 80) {
+              printf "FAIL: coverage %.1f%% is below the 80%% threshold\n", cov
+              exit 1
+            }
+            printf "OK: coverage %.1f%%\n", cov
+          }'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.out
+          retention-days: 7
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run integration tests in Docker
+        run: make test-integration
+
+  load-tests:
+    name: Load Tests (normal + spike)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app image
+        run: make build
+
+      - name: Run normal load test (~2 min)
+        run: make test-load
+
+      - name: Run spike test (~30 s)
+        run: make test-spike
+
+      - name: Stop services
+        if: always()
+        run: docker compose down -v
+
+  security-scan:
+    name: Security Scan (gosec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      - name: Run gosec
+        run: gosec -exclude-dir=tests ./...

@@ -1,0 +1,23 @@
+name: Nightly Endurance Test
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # 02:00 UTC every night
+  workflow_dispatch:        # allow manual trigger
+
+jobs:
+  endurance:
+    name: K6 Endurance Test (~11 min)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app image
+        run: make build
+
+      - name: Run endurance test
+        run: make test-endurance
+
+      - name: Stop services
+        if: always()
+        run: docker compose down -v

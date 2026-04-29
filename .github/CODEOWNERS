@@ -1,0 +1,9 @@
+# All files require review from the maintainer.
+* @sebastien-jorge
+
+# Core rate-limiting logic — critical path, extra care required.
+/internal/service/ @sebastien-jorge
+/internal/storage/ @sebastien-jorge
+
+# CI/CD changes must go through the same review.
+/.github/ @sebastien-jorge
