@@ -13,6 +13,7 @@ A production-ready HTTP rate limiting service built in Go. It enforces per-clien
 - [Architecture](#architecture)
 - [Algorithm](#algorithm)
 - [Storage](#storage)
+- [Observability](#observability)
 - [API Reference](#api-reference)
   - [POST /check](#post-check)
   - [GET /policies](#get-policies)
@@ -87,6 +88,56 @@ The `HybridStore` wraps both a Redis store and an in-memory store with automatic
 3. **Redis recovery** — once Redis is reachable again the store switches back automatically; no restart required.
 
 The `/health` endpoint reflects the current storage status.
+
+---
+
+## Observability
+
+The service is instrumented across three pillars. All three are **no-op by default** and activate only when the relevant environment variables are set, so the service starts cleanly with no external dependencies.
+
+### Structured logging
+
+All log output is JSON, written to stdout. Every log line is a flat object with consistent fields:
+
+```json
+{
+  "time": "2026-04-29T18:00:00Z",
+  "level": "INFO",
+  "msg": "request",
+  "trace_id": "a1b2c3d4-...",
+  "method": "POST",
+  "path": "/check",
+  "status": 200,
+  "latency_ms": 3,
+  "dd.trace_id": "7234103429384",
+  "dd.span_id":  "2456731823"
+}
+```
+
+`dd.trace_id` and `dd.span_id` are present when an active Datadog APM span exists, which is what Datadog uses to link a log line directly to its trace in the UI.
+
+### Metrics (DogStatsD)
+
+Metrics are sent to a DogStatsD agent when `DD_AGENT_HOST` is set. All metric names are prefixed with `rate_limiter.`.
+
+| Metric | Type | Tags | Description |
+|---|---|---|---|
+| `rate_limiter.http.requests` | counter | `endpoint`, `status` | Total HTTP requests per endpoint and status code |
+| `rate_limiter.http.latency_ms` | histogram | `endpoint`, `status` | Request latency in milliseconds |
+| `rate_limiter.decision.allowed` | counter | `client_id`, `route` | Requests allowed by the rate limiter |
+| `rate_limiter.decision.denied` | counter | `client_id`, `route` | Requests rejected by the rate limiter |
+
+### APM traces (Datadog)
+
+When `DD_AGENT_HOST` is set, the service starts a Datadog APM tracer and wraps the Gin router with `dd-trace-go`. Every HTTP request gets a span with the route, method, and status code. Additional environment variables:
+
+| Variable | Description | Example |
+|---|---|---|
+| `DD_AGENT_HOST` | Enables both DogStatsD metrics and APM tracing | `datadog-agent` |
+| `DD_ENV` | Deployment environment tag | `production` |
+| `DD_VERSION` | Service version tag | `1.2.0` |
+
+> **Provider note:** logging (`slog`) and metrics (behind the `Metrics` interface) are provider-agnostic and straightforward to swap. The APM tracer (`dd-trace-go`) is Datadog-specific; migrating to another provider would require replacing it with an OpenTelemetry SDK.
 
 ---
 

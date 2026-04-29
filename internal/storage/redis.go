@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"time"
 
@@ -22,12 +23,17 @@ type RedisStore struct {
 	prefix string
 }
 
-func NewRedisStore(host string, port, db int, prefix string) (*RedisStore, error) {
-	client := redis.NewClient(&redis.Options{
+func NewRedisStore(host string, port, db int, password string, tlsEnabled bool, prefix string) (*RedisStore, error) {
+	opts := &redis.Options{
 		Addr:     fmt.Sprintf("%s:%d", host, port),
 		DB:       db,
+		Password: password,
 		PoolSize: 10,
-	})
+	}
+	if tlsEnabled {
+		opts.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	client := redis.NewClient(opts)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

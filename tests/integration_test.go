@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sebastien-jorge/rate-limiter/internal/handler"
 	"github.com/sebastien-jorge/rate-limiter/internal/models"
+	"github.com/sebastien-jorge/rate-limiter/internal/observability"
 	"github.com/sebastien-jorge/rate-limiter/internal/service"
 	"github.com/sebastien-jorge/rate-limiter/internal/storage"
 	"github.com/stretchr/testify/assert"
@@ -62,7 +63,7 @@ func SetupTestApp() (*gin.Engine, func()) {
 	store := storage.NewMemoryStore()
 	rl := service.NewRateLimiter()
 	pm := service.NewPolicyMatcher(testPolicies)
-	h := handler.New(rl, pm, store)
+	h := handler.New(rl, pm, store, observability.NewNoopMetrics())
 
 	r := gin.New()
 	r.Use(gin.Recovery())

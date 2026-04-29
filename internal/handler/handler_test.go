@@ -2,7 +2,9 @@ package handler_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sebastien-jorge/rate-limiter/internal/handler"
 	"github.com/sebastien-jorge/rate-limiter/internal/models"
+	"github.com/sebastien-jorge/rate-limiter/internal/observability"
 	"github.com/sebastien-jorge/rate-limiter/internal/service"
 	"github.com/sebastien-jorge/rate-limiter/internal/storage"
 	"github.com/stretchr/testify/assert"
@@ -21,15 +24,31 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
+// failingStore is a Store stub whose Health() always returns an error.
+type failingStore struct{}
+
+func (f *failingStore) Set(_ context.Context, _ string, _ int64, _ time.Duration) error {
+	return nil
+}
+func (f *failingStore) Get(_ context.Context, _ string) (int64, error)               { return 0, nil }
+func (f *failingStore) Increment(_ context.Context, _ string, _ int64, _ time.Duration) (int64, error) {
+	return 0, nil
+}
+func (f *failingStore) Delete(_ context.Context, _ string) error          { return nil }
+func (f *failingStore) Exists(_ context.Context, _ string) (bool, error)  { return false, nil }
+func (f *failingStore) Clear(_ context.Context) error                     { return nil }
+func (f *failingStore) Health(_ context.Context) error                    { return errors.New("storage unavailable") }
+
 // setupRouter builds a test router wired with the given policies.
 func setupRouter(policies []*models.ClientPolicy) *gin.Engine {
 	rl := service.NewRateLimiter()
 	pm := service.NewPolicyMatcher(policies)
 	store := storage.NewMemoryStore()
-	h := handler.New(rl, pm, store)
+	h := handler.New(rl, pm, store, observability.NewNoopMetrics())
 
 	r := gin.New()
 	r.Use(handler.RequestID())
+	r.Use(handler.MetricsMiddleware(observability.NewNoopMetrics()))
 	h.RegisterRoutes(r)
 	return r
 }
@@ -260,11 +279,47 @@ func TestGetAllPolicies(t *testing.T) {
 	assert.ElementsMatch(t, []string{"partner", "application"}, resp.Clients)
 }
 
+func TestCheck_IdentifierNone(t *testing.T) {
+	policy := &models.ClientPolicy{
+		ClientID: "client-e",
+		Routes: []models.RoutePolicy{
+			{Route: "/api", RouteType: models.RouteExact, Method: "GET", Limit: 2, Window: time.Minute, Identifier: models.IdentifierNone},
+		},
+	}
+	r := setupRouter([]*models.ClientPolicy{policy})
+
+	body := map[string]any{"client_id": "client-e", "route": "/api", "method": "GET"}
+	postCheck(r, body)
+	postCheck(r, body)
+	w := postCheck(r, body)
+	assert.Equal(t, http.StatusTooManyRequests, w.Code, "global bucket should be exhausted")
+}
+
+func TestHealth_Degraded(t *testing.T) {
+	rl := service.NewRateLimiter()
+	pm := service.NewPolicyMatcher(nil)
+	h := handler.New(rl, pm, &failingStore{}, observability.NewNoopMetrics())
+
+	r := gin.New()
+	r.Use(handler.RequestID())
+	h.RegisterRoutes(r)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	var resp handler.HealthResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, "degraded", resp.Status)
+	assert.Equal(t, "degraded", resp.Storage)
+}
+
 func TestLogger_DoesNotBreakRequests(t *testing.T) {
 	rl := service.NewRateLimiter()
 	pm := service.NewPolicyMatcher(nil)
 	store := storage.NewMemoryStore()
-	h := handler.New(rl, pm, store)
+	h := handler.New(rl, pm, store, observability.NewNoopMetrics())
 
 	r := gin.New()
 	r.Use(handler.RequestID())

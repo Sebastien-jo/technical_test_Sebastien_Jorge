@@ -175,7 +175,7 @@ func TestMemoryStore_ConcurrentIncrement_IsAtomic(t *testing.T) {
 
 func newRedisStoreOrSkip(t *testing.T) *RedisStore {
 	t.Helper()
-	s, err := NewRedisStore("localhost", 6379, 15, "test:rl:")
+	s, err := NewRedisStore("localhost", 6379, 15, "", false, "test:rl:")
 	if err != nil {
 		t.Skipf("Redis not available: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestRedisStore_TTLExpiry(t *testing.T) {
 
 func TestHybridStore_MemoryFallbackWhenRedisDown(t *testing.T) {
 	// Point to a port with nothing listening → forces memory fallback.
-	hs, err := NewHybridStore("localhost", 19999, 0, "test:")
+	hs, err := NewHybridStore("localhost", 19999, 0, "", false, "test:")
 	require.NoError(t, err, "NewHybridStore should never return an error")
 	defer hs.Close()
 
@@ -219,8 +219,28 @@ func TestHybridStore_MemoryFallbackWhenRedisDown(t *testing.T) {
 }
 
 func TestHybridStore_Contract_MemoryMode(t *testing.T) {
-	hs, err := NewHybridStore("localhost", 19999, 0, "test:")
+	hs, err := NewHybridStore("localhost", 19999, 0, "", false, "test:")
 	require.NoError(t, err)
 	defer hs.Close()
 	testStore(t, hs)
+}
+
+func TestMemoryStore_PurgeExpired(t *testing.T) {
+	ms := NewMemoryStore()
+	defer ms.Close()
+
+	ctx := context.Background()
+	require.NoError(t, ms.Set(ctx, "alive", 1, time.Hour))
+	require.NoError(t, ms.Set(ctx, "dead", 2, time.Nanosecond))
+
+	time.Sleep(5 * time.Millisecond)
+	ms.purgeExpired()
+
+	val, err := ms.Get(ctx, "alive")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), val, "non-expired key must survive purge")
+
+	val, err = ms.Get(ctx, "dead")
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), val, "expired key must be removed by purge")
 }

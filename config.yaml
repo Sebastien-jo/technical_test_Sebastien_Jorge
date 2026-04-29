@@ -6,6 +6,8 @@ redis:
   host: localhost
   port: 6379
   db: 0
+  password: ""   # set via REDIS_PASSWORD env var
+  tls: false     # set REDIS_TLS=true for ElastiCache in-transit encryption
 
 policies:
   - client_id: partner

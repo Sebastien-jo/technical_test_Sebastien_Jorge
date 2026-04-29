@@ -2,15 +2,16 @@ package storage
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type redisCfg struct {
-	host, prefix string
-	port, db     int
+	host, prefix, password string
+	port, db               int
+	tlsEnabled             bool
 }
 
 type HybridStore struct {
@@ -25,17 +26,17 @@ type HybridStore struct {
 	done        chan struct{}
 }
 
-func NewHybridStore(host string, port, db int, prefix string) (*HybridStore, error) {
-	cfg := redisCfg{host: host, port: port, db: db, prefix: prefix}
+func NewHybridStore(host string, port, db int, password string, tlsEnabled bool, prefix string) (*HybridStore, error) {
+	cfg := redisCfg{host: host, port: port, db: db, password: password, tlsEnabled: tlsEnabled, prefix: prefix}
 	hs := &HybridStore{
 		memory: NewMemoryStore(),
 		cfg:    cfg,
 		done:   make(chan struct{}),
 	}
 
-	r, err := NewRedisStore(host, port, db, prefix)
+	r, err := NewRedisStore(host, port, db, password, tlsEnabled, prefix)
 	if err != nil {
-		log.Printf("[storage] Redis unavailable at startup, using memory fallback: %v", err)
+		slog.Warn("[storage] Redis unavailable at startup, using memory fallback", "error", err)
 		hs.usingMem.Store(true)
 		hs.startReconnect()
 	} else {
@@ -143,7 +144,7 @@ func (hs *HybridStore) tryRedis() (*RedisStore, bool) {
 
 func (hs *HybridStore) onRedisFailure() {
 	if hs.usingMem.CompareAndSwap(false, true) {
-		log.Printf("[storage] Redis error detected, switching to in-memory fallback")
+		slog.Warn("[storage] Redis error detected, switching to in-memory fallback")
 		hs.startReconnect()
 	}
 }
@@ -165,9 +166,9 @@ func (hs *HybridStore) reconnectLoop() {
 		case <-hs.done:
 			return
 		case <-ticker.C:
-			r, err := NewRedisStore(hs.cfg.host, hs.cfg.port, hs.cfg.db, hs.cfg.prefix)
+			r, err := NewRedisStore(hs.cfg.host, hs.cfg.port, hs.cfg.db, hs.cfg.password, hs.cfg.tlsEnabled, hs.cfg.prefix)
 			if err != nil {
-				log.Printf("[storage] Redis reconnect attempt failed: %v", err)
+				slog.Warn("[storage] Redis reconnect attempt failed", "error", err)
 				continue
 			}
 			hs.mu.Lock()
@@ -177,7 +178,7 @@ func (hs *HybridStore) reconnectLoop() {
 			hs.redis = r
 			hs.mu.Unlock()
 			hs.usingMem.Store(false)
-			log.Printf("[storage] Redis reconnected successfully")
+			slog.Info("[storage] Redis reconnected successfully")
 			return
 		}
 	}

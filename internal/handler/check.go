@@ -54,6 +54,13 @@ func (h *Handler) Check(c *gin.Context) {
 	}
 	decision := h.rateLimiter.Check(req.ClientID, routePolicy, identifier)
 
+	tags := []string{"client_id:" + req.ClientID, "route:" + routePolicy.Route}
+	if decision.Allowed {
+		_ = h.metrics.Incr("decision.allowed", tags, 1)
+	} else {
+		_ = h.metrics.Incr("decision.denied", tags, 1)
+	}
+
 	c.Header("X-RateLimit-Limit", fmt.Sprintf("%d", routePolicy.Limit))
 	c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", decision.Remaining))
 	c.Header("X-RateLimit-Reset", fmt.Sprintf("%d", decision.ResetTime.Unix()))
