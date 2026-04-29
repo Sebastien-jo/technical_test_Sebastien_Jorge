@@ -1,5 +1,9 @@
 # Rate Limiter Service
 
+[![PR Checks](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/pr-checks.yml/badge.svg)](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/pr-checks.yml)
+[![Main Merge](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/main-merge.yml/badge.svg)](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/main-merge.yml)
+[![Nightly Endurance](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/schedule-extended-tests.yml/badge.svg)](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/schedule-extended-tests.yml)
+
 A production-ready HTTP rate limiting service built in Go with Redis storage and an in-memory fallback.
 
 ## Architecture
@@ -175,6 +179,48 @@ Same strict thresholds as the normal load test (`p(95) < 500ms`).
 | Load         | ~2min    | p95 < 500ms, <10% failures             |
 | Spike        | ~30s     | p99 < 2s, no panics                    |
 | Endurance    | ~11min   | Stable latency, no memory growth       |
+
+## CI/CD Pipeline
+
+### Workflows
+
+| Workflow | Trigger | Jobs |
+|----------|---------|------|
+| **PR Checks** | Every pull request to `main` | lint, unit tests (race + coverage), integration tests, load + spike tests, gosec scan |
+| **Main Merge** | Push to `main` | All PR checks → Docker build → Trivy container scan → deployment smoke test |
+| **Nightly Endurance** | `cron: 0 2 * * *` (manual via `workflow_dispatch`) | K6 endurance test (~11 min) |
+
+### PR Checks detail
+
+All five jobs run in **parallel**:
+
+- **Lint** — `golangci-lint` with `errcheck`, `govet`, `staticcheck`, `gosec`, `gocritic`, and more
+- **Unit Tests** — `go test -race` across `./internal/...` with 80% coverage threshold enforced
+- **Integration Tests** — Go end-to-end tests in Docker via `make test-integration`
+- **Load Tests** — K6 normal load (~2 min) + spike (~30 s) via Docker Compose
+- **Security Scan** — `gosec` static analysis for common Go security issues
+
+### Main merge additions
+
+After all PR checks pass:
+
+- Docker image is built and exported as a workflow artifact
+- **Trivy** scans the image for `CRITICAL` and `HIGH` vulnerabilities — fails the build if any are found
+- A smoke test starts the full stack and exercises every endpoint
+
+### Running CI checks locally
+
+```bash
+make ci-lint          # golangci-lint
+make ci-unit          # unit tests with -race + coverage report
+make ci-integration   # integration tests in Docker
+make ci-load          # build image, then load + spike tests
+make ci-all           # everything above in sequence
+```
+
+### Dependency updates
+
+[Dependabot](.github/dependabot.yml) opens weekly PRs to update Go modules and GitHub Actions pins. PRs are labelled `dependencies` and respect the standard PR check gate.
 
 ## Troubleshooting
 

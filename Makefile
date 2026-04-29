@@ -2,6 +2,7 @@ DC = docker compose
 
 .PHONY: help up down logs build health \
         test-integration test-load test-spike test-endurance test-all full-test \
+        ci-lint ci-unit ci-integration ci-load ci-all \
         clean
 
 help:
@@ -24,6 +25,13 @@ help:
 	@echo "    make test-endurance   Run K6 endurance test (~11min)"
 	@echo "    make test-all         Run integration + all K6 tests"
 	@echo "    make full-test        up → test-all → down"
+	@echo ""
+	@echo "  CI targets (mirrors GitHub Actions jobs):"
+	@echo "    make ci-lint          Run golangci-lint"
+	@echo "    make ci-unit          Run unit tests with -race + coverage"
+	@echo "    make ci-integration   Run integration tests in Docker"
+	@echo "    make ci-load          Build image + run load + spike tests"
+	@echo "    make ci-all           Run all CI checks locally"
 	@echo ""
 
 up:
@@ -67,6 +75,22 @@ full-test:
 	$(MAKE) test-spike
 	$(MAKE) test-endurance
 	$(MAKE) down
+
+ci-lint:
+	golangci-lint run ./...
+
+ci-unit:
+	go test -v -race -coverprofile=coverage.out -covermode=atomic ./internal/...
+
+ci-integration:
+	$(MAKE) test-integration
+
+ci-load:
+	$(MAKE) build
+	$(MAKE) test-load
+	$(MAKE) test-spike
+
+ci-all: ci-lint ci-unit ci-integration ci-load
 
 clean:
 	$(DC) down -v --remove-orphans

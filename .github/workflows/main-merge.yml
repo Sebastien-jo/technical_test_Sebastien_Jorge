@@ -1,0 +1,102 @@
+name: Main Merge
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # Re-run all PR checks on the merged commit.
+  pr-checks:
+    name: PR Checks
+    uses: ./.github/workflows/pr-checks.yml
+
+  docker-build:
+    name: Build & Export Docker Image
+    needs: pr-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image and export to tar
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: rate-limiter:${{ github.sha }}
+          outputs: type=docker,dest=/tmp/rate-limiter.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: /tmp/rate-limiter.tar
+          retention-days: 3
+
+  trivy-scan:
+    name: Container Security Scan (Trivy)
+    needs: docker-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/rate-limiter.tar
+
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: rate-limiter:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+
+  deployment-test:
+    name: Deployment Smoke Test
+    needs: docker-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/rate-limiter.tar
+
+      - name: Tag image to match compose expectations
+        run: docker tag rate-limiter:${{ github.sha }} technical_test_sebastien_jorge-app:latest
+
+      - name: Start stack
+        run: docker compose up -d redis app
+
+      - name: Wait for health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health; then
+              echo "Service is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Service did not become healthy in time"
+          docker compose logs app
+          exit 1
+
+      - name: Smoke-test all endpoints
+        run: |
+          curl -sf http://localhost:8080/policies | grep -q '"clients"'
+          curl -sf http://localhost:8080/policies/partner | grep -q '"routes"'
+          curl -sf -X POST http://localhost:8080/check \
+            -H 'Content-Type: application/json' \
+            -d '{"client_id":"partner","route":"/api/videos","method":"GET"}' \
+            | grep -q '"allowed"'
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
