@@ -178,7 +178,7 @@ func TestRoutePolicy_Validate_UnknownIdentifier(t *testing.T) {
 }
 
 func TestRoutePolicy_Validate_AllIdentifiers(t *testing.T) {
-	for _, id := range []IdentifierType{IdentifierNone, IdentifierSessionID, IdentifierIP, IdentifierIPUserAgent} {
+	for _, id := range []IdentifierType{IdentifierNone, IdentifierSessionID, IdentifierIPUserAgent} {
 		rp := validRoutePolicy()
 		rp.Identifier = id
 		assert.NoError(t, rp.Validate(), "identifier %q should be valid", id)

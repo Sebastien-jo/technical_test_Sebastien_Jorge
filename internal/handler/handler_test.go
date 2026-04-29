@@ -144,7 +144,7 @@ func TestCheck_UnknownRoute(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
-func TestCheck_IdentifierIP(t *testing.T) {
+func TestCheck_IdentifierIPUserAgent(t *testing.T) {
 	policy := &models.ClientPolicy{
 		ClientID: "client-d",
 		Routes: []models.RoutePolicy{
@@ -154,17 +154,18 @@ func TestCheck_IdentifierIP(t *testing.T) {
 				Method:     "GET",
 				Limit:      2,
 				Window:     time.Minute,
-				Identifier: models.IdentifierIP,
+				Identifier: models.IdentifierIPUserAgent,
 			},
 		},
 	}
 	r := setupRouter([]*models.ClientPolicy{policy})
 
 	body := map[string]any{
-		"client_id": "client-d",
-		"route":     "/stream",
-		"method":    "GET",
-		"ip":        "1.2.3.4",
+		"client_id":  "client-d",
+		"route":      "/stream",
+		"method":     "GET",
+		"ip":         "1.2.3.4",
+		"user_agent": "Mozilla/5.0",
 	}
 
 	postCheck(r, body)

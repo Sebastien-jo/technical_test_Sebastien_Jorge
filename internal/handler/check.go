@@ -47,7 +47,11 @@ func (h *Handler) Check(c *gin.Context) {
 		return
 	}
 
-	identifier := buildIdentifier(&req, routePolicy.Identifier)
+	identifier, err := buildIdentifier(&req, routePolicy.Identifier)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	decision := h.rateLimiter.Check(req.ClientID, routePolicy, identifier)
 
 	c.Header("X-RateLimit-Limit", fmt.Sprintf("%d", routePolicy.Limit))
@@ -72,15 +76,19 @@ func (h *Handler) Check(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func buildIdentifier(req *CheckRequest, identType models.IdentifierType) string {
+func buildIdentifier(req *CheckRequest, identType models.IdentifierType) (string, error) {
 	switch identType {
 	case models.IdentifierSessionID:
-		return req.SessionID
-	case models.IdentifierIP:
-		return req.IP
+		if req.SessionID == "" {
+			return "", errors.New("policy requires session_id but it is missing from the request")
+		}
+		return req.SessionID, nil
 	case models.IdentifierIPUserAgent:
-		return req.IP + ":" + req.UserAgent
+		if req.IP == "" || req.UserAgent == "" {
+			return "", errors.New("policy requires ip and user_agent but one or both are missing from the request")
+		}
+		return req.IP + ":" + req.UserAgent, nil
 	default:
-		return "global"
+		return "global", nil
 	}
 }

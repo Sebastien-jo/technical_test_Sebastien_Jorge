@@ -41,7 +41,7 @@ policies:
         method: POST
         limit: 5
         window: 1m
-        identifier: ip
+        identifier: ip_user_agent
   - client_id: internal_service
     routes:
       - route: /
@@ -63,4 +63,4 @@ policies:
         method: GET
         limit: 300
         window: 1m
-        identifier: ip
+        identifier: ip_user_agent

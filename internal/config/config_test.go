@@ -64,7 +64,7 @@ func TestToRoutePolicy_ExactRouteType(t *testing.T) {
 }
 
 func TestToRoutePolicy_AllIdentifiers(t *testing.T) {
-	for _, id := range []string{"none", "session_id", "ip", "ip_user_agent"} {
+	for _, id := range []string{"none", "session_id", "ip_user_agent"} {
 		rc := validRouteConfig()
 		rc.Identifier = id
 		_, err := rc.ToRoutePolicy()
@@ -166,7 +166,7 @@ func TestLoadPolicies_MultipleClients(t *testing.T) {
 		{
 			"client_id": "client-b",
 			"routes": []map[string]interface{}{
-				{"route": "/b", "route_type": "exact", "method": "POST", "limit": 5, "window": "30s", "identifier": "ip"},
+				{"route": "/b", "route_type": "exact", "method": "POST", "limit": 5, "window": "30s", "identifier": "ip_user_agent"},
 			},
 		},
 	})

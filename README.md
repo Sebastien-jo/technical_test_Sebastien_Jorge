@@ -115,8 +115,8 @@ Content-Type: application/json
 | `route`      | string | **yes**  | The request path (e.g. `/api/videos/123`)                    |
 | `method`     | string | **yes**  | HTTP method of the original request (e.g. `GET`, `POST`)     |
 | `session_id` | string | no       | Session token; used when the policy identifier is `session_id` |
-| `ip`         | string | no       | Client IP; used when the policy identifier is `ip` or `ip_user_agent` |
-| `user_agent` | string | no       | User-Agent string; used when the policy identifier is `ip_user_agent` |
+| `ip`         | string | no       | Client IP; used when the policy identifier is `ip_user_agent`         |
+| `user_agent` | string | no       | User-Agent string; used when the policy identifier is `ip_user_agent`  |
 
 **Example request:**
 
@@ -261,7 +261,7 @@ GET /policies/mobile_app
       "method":     "POST",
       "limit":      10,
       "window":     "1h0m0s",
-      "identifier": "ip"
+      "identifier": "ip_user_agent"
     }
   ]
 }
@@ -377,8 +377,7 @@ The `identifier` field on a route policy controls how requests are bucketed — 
 |-----------------|---------------------------|-------------------------------------------------------------|
 | `none`          | (nothing extra)           | One shared bucket for all callers of this client+route      |
 | `session_id`    | `session_id` from request | Per-authenticated-session quota                             |
-| `ip`            | `ip` from request         | Per-source-IP quota                                         |
-| `ip_user_agent` | `ip` + `user_agent`       | Per-device quota (stricter fingerprinting)                  |
+| `ip_user_agent` | `ip` + `user_agent`       | Per-device quota (IP + User-Agent couple)                   |
 
 ---
 
@@ -404,7 +403,7 @@ policies:
         method: "*"              # HTTP method or "*" for all
         limit: 100               # requests allowed per window
         window: 1m               # time window (Go duration: 30s, 5m, 1h, …)
-        identifier: session_id   # "none" | "session_id" | "ip" | "ip_user_agent"
+        identifier: session_id   # "none" | "session_id" | "ip_user_agent"
 
       - route: /api/upload
         route_type: exact

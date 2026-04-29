@@ -38,7 +38,7 @@ var testPolicies = []*models.ClientPolicy{
 		Routes: []models.RoutePolicy{
 			{Route: "/api/videos", RouteType: models.RoutePrefix, Method: "*", Limit: 100, Window: time.Minute, Identifier: models.IdentifierSessionID},
 			{Route: "/api/users", RouteType: models.RouteExact, Method: "GET", Limit: 10, Window: time.Minute, Identifier: models.IdentifierNone},
-			{Route: "/api/payment", RouteType: models.RouteExact, Method: "POST", Limit: 5, Window: time.Minute, Identifier: models.IdentifierIP},
+			{Route: "/api/payment", RouteType: models.RouteExact, Method: "POST", Limit: 5, Window: time.Minute, Identifier: models.IdentifierIPUserAgent},
 		},
 	},
 	{
@@ -51,7 +51,7 @@ var testPolicies = []*models.ClientPolicy{
 		ClientID: "api_consumer",
 		Routes: []models.RoutePolicy{
 			{Route: "/api/videos", RouteType: models.RoutePrefix, Method: "*", Limit: 100, Window: time.Minute, Identifier: models.IdentifierIPUserAgent},
-			{Route: "/api", RouteType: models.RoutePrefix, Method: "GET", Limit: 300, Window: time.Minute, Identifier: models.IdentifierIP},
+			{Route: "/api", RouteType: models.RoutePrefix, Method: "GET", Limit: 300, Window: time.Minute, Identifier: models.IdentifierIPUserAgent},
 		},
 	},
 }
@@ -134,10 +134,10 @@ func TestCheckEndpointDenied(t *testing.T) {
 	defer cleanup()
 
 	for i := 0; i < 5; i++ {
-		doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "1.2.3.4"})
+		doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "1.2.3.4", UserAgent: "ua"})
 	}
 
-	code, resp := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "1.2.3.4"})
+	code, resp := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "1.2.3.4", UserAgent: "ua"})
 	require.Equal(t, http.StatusTooManyRequests, code)
 	assert.False(t, resp.Allowed)
 	assert.NotEmpty(t, resp.Message)
@@ -148,10 +148,10 @@ func TestCheckEndpointRetryAfter(t *testing.T) {
 	defer cleanup()
 
 	for i := 0; i < 5; i++ {
-		doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "10.0.0.1"})
+		doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "10.0.0.1", UserAgent: "ua"})
 	}
 
-	_, resp := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "10.0.0.1"})
+	_, resp := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "10.0.0.1", UserAgent: "ua"})
 	assert.Greater(t, resp.RetryAfter, int64(0))
 }
 
@@ -198,12 +198,12 @@ func TestQuotaSeparatedByIdentifier(t *testing.T) {
 	defer cleanup()
 
 	for i := 0; i < 5; i++ {
-		doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "1.1.1.1"})
+		doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "1.1.1.1", UserAgent: "ua"})
 	}
-	code1, _ := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "1.1.1.1"})
+	code1, _ := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "1.1.1.1", UserAgent: "ua"})
 	assert.Equal(t, http.StatusTooManyRequests, code1, "IP 1.1.1.1 exhausted")
 
-	code2, _ := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "2.2.2.2"})
+	code2, _ := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "2.2.2.2", UserAgent: "ua"})
 	assert.Equal(t, http.StatusOK, code2, "IP 2.2.2.2 has its own bucket")
 }
 
@@ -212,13 +212,13 @@ func TestQuotaSeparatedByIPIdentifier(t *testing.T) {
 	defer cleanup()
 
 	for i := 0; i < 5; i++ {
-		doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "10.0.0.1"})
+		doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "10.0.0.1", UserAgent: "ua"})
 	}
 
-	code1, _ := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "10.0.0.1"})
+	code1, _ := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "10.0.0.1", UserAgent: "ua"})
 	assert.Equal(t, http.StatusTooManyRequests, code1)
 
-	code2, _ := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "10.0.0.2"})
+	code2, _ := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "10.0.0.2", UserAgent: "ua"})
 	assert.Equal(t, http.StatusOK, code2)
 }
 
@@ -369,10 +369,10 @@ func TestRetryAfterHeader(t *testing.T) {
 	defer cleanup()
 
 	for i := 0; i < 5; i++ {
-		doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "3.3.3.3"})
+		doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "3.3.3.3", UserAgent: "ua"})
 	}
 
-	body, _ := json.Marshal(checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "3.3.3.3"})
+	body, _ := json.Marshal(checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "3.3.3.3", UserAgent: "ua"})
 	req := httptest.NewRequest(http.MethodPost, "/check", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -550,12 +550,12 @@ func TestQuotaPersistsAcrossRequests(t *testing.T) {
 
 	// Consume 4 of 5 tokens.
 	for i := 0; i < 4; i++ {
-		code, _ := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "5.5.5.5"})
+		code, _ := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "5.5.5.5", UserAgent: "ua"})
 		require.Equal(t, http.StatusOK, code)
 	}
 
 	// 5th request: 1 token consumed, 0 remaining.
-	_, resp := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "5.5.5.5"})
+	_, resp := doCheck(r, checkReq{ClientID: "application", Route: "/api/payment", Method: "POST", IP: "5.5.5.5", UserAgent: "ua"})
 	assert.Equal(t, int64(0), resp.Remaining, "last token consumed, 0 left")
 }
 

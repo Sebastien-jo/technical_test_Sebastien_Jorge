@@ -23,7 +23,6 @@ type IdentifierType string
 const (
 	IdentifierNone        IdentifierType = "none"
 	IdentifierSessionID   IdentifierType = "session_id"
-	IdentifierIP          IdentifierType = "ip"
 	IdentifierIPUserAgent IdentifierType = "ip_user_agent"
 )
 
@@ -56,7 +55,7 @@ func (rp *RoutePolicy) Validate() error {
 		return ErrInvalidWindow
 	}
 	switch rp.Identifier {
-	case IdentifierNone, IdentifierSessionID, IdentifierIP, IdentifierIPUserAgent:
+	case IdentifierNone, IdentifierSessionID, IdentifierIPUserAgent:
 	default:
 		return &ValidationError{
 			Field:   "identifier",
