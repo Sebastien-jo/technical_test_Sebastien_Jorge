@@ -9,7 +9,7 @@ A production-ready HTTP rate limiting service built in Go with Redis storage and
 ## Architecture
 
 ```
-cmd/server/         — entrypoint, wires all layers
+cmd/         — entrypoint, wires all layers
 internal/
   config/           — Viper config loading, policy deserialization
   models/           — domain types (no framework dependencies)

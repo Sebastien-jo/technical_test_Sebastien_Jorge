@@ -13,12 +13,12 @@ const requestIDKey = "request_id"
 
 func RequestID() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		id := c.GetHeader("X-Request-ID")
+		id := c.GetHeader("X-Trace-ID")
 		if id == "" {
 			id = newRequestID()
 		}
 		c.Set(requestIDKey, id)
-		c.Header("X-Request-ID", id)
+		c.Header("X-Trace-ID", id)
 		c.Next()
 	}
 }

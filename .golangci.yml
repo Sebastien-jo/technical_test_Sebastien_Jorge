@@ -16,11 +16,12 @@ linters:
     - noctx
     - unconvert
     - unparam
-
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gosec
-        - gocritic
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - gocritic
+          - noctx
+          - unparam

@@ -22,12 +22,14 @@ func (h *Handler) Health(c *gin.Context) {
 		storageStatus = "degraded"
 	}
 
+	httpStatus := http.StatusOK
 	status := "ok"
 	if storageStatus != "ok" {
 		status = "degraded"
+		httpStatus = http.StatusServiceUnavailable
 	}
 
-	c.JSON(http.StatusOK, HealthResponse{
+	c.JSON(httpStatus, HealthResponse{
 		Status:  status,
 		Storage: storageStatus,
 	})

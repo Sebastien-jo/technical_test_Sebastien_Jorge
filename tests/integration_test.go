@@ -337,15 +337,15 @@ func TestTraceIDHeader(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
-	assert.NotEmpty(t, w.Header().Get("X-Request-ID"))
+	assert.NotEmpty(t, w.Header().Get("X-Trace-ID"))
 }
 
 func TestTraceIDPassthroughWhenPresent(t *testing.T) {
 	r, cleanup := SetupTestApp()
 	defer cleanup()
 
-	w := doGetWithHeader(r, "/health", "X-Request-ID", "trace-xyz-123")
-	assert.Equal(t, "trace-xyz-123", w.Header().Get("X-Request-ID"))
+	w := doGetWithHeader(r, "/health", "X-Trace-ID", "trace-xyz-123")
+	assert.Equal(t, "trace-xyz-123", w.Header().Get("X-Trace-ID"))
 }
 
 func TestRateLimitHeaders(t *testing.T) {

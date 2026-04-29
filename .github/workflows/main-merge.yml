@@ -56,21 +56,15 @@ jobs:
 
   deployment-test:
     name: Deployment Smoke Test
-    needs: docker-build
+    needs: pr-checks
     runs-on: ubuntu-latest
+    env:
+      COMPOSE_PROJECT_NAME: rate-limiter-ci
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: docker-image-${{ github.sha }}
-          path: /tmp
-
-      - name: Load image
-        run: docker load -i /tmp/rate-limiter.tar
-
-      - name: Tag image to match compose expectations
-        run: docker tag rate-limiter:${{ github.sha }} technical_test_sebastien_jorge-app:latest
+      - name: Build app image
+        run: make build
 
       - name: Start stack
         run: docker compose up -d redis app

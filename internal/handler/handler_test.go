@@ -228,16 +228,51 @@ func TestRequestID_GeneratedWhenAbsent(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	assert.NotEmpty(t, w.Header().Get("X-Request-ID"))
+	assert.NotEmpty(t, w.Header().Get("X-Trace-ID"))
 }
 
 func TestRequestID_PassedThroughWhenPresent(t *testing.T) {
 	r := setupRouter(nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	req.Header.Set("X-Request-ID", "my-trace-id")
+	req.Header.Set("X-Trace-ID", "my-trace-id")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	assert.Equal(t, "my-trace-id", w.Header().Get("X-Request-ID"))
+	assert.Equal(t, "my-trace-id", w.Header().Get("X-Trace-ID"))
+}
+
+func TestGetAllPolicies(t *testing.T) {
+	r := setupRouter([]*models.ClientPolicy{
+		testPolicy("partner", "/api/videos", "GET", 100, time.Minute),
+		testPolicy("application", "/api/users", "POST", 10, time.Minute),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/policies", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp handler.AllClientsResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.ElementsMatch(t, []string{"partner", "application"}, resp.Clients)
+}
+
+func TestLogger_DoesNotBreakRequests(t *testing.T) {
+	rl := service.NewRateLimiter()
+	pm := service.NewPolicyMatcher(nil)
+	store := storage.NewMemoryStore()
+	h := handler.New(rl, pm, store)
+
+	r := gin.New()
+	r.Use(handler.RequestID())
+	r.Use(handler.Logger())
+	h.RegisterRoutes(r)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
 }
