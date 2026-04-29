@@ -112,8 +112,6 @@ func doGetWithHeader(r *gin.Engine, path, key, value string) *httptest.ResponseR
 	return w
 }
 
-// ── 1. Basic Functionality ───────────────────────────────────────────────────
-
 func TestCheckEndpointAllow(t *testing.T) {
 	r, cleanup := SetupTestApp()
 	defer cleanup()
@@ -163,8 +161,6 @@ func TestCheckEndpointResetTime(t *testing.T) {
 	_, resp := doCheck(r, checkReq{ClientID: "application", Route: "/api/videos", Method: "GET", SessionID: "session-rst"})
 	assert.GreaterOrEqual(t, resp.ResetTime, time.Now().Unix())
 }
-
-// ── 2. Quota Isolation ───────────────────────────────────────────────────────
 
 func TestQuotaSeparatedByClient(t *testing.T) {
 	r, cleanup := SetupTestApp()
@@ -605,4 +601,55 @@ func TestMethodCaseInsensitive(t *testing.T) {
 	// Our policy matcher uses strings.EqualFold — lowercase "get" should match.
 	code, _ := doCheck(r, checkReq{ClientID: "application", Route: "/api/users", Method: "get"})
 	assert.Equal(t, http.StatusOK, code)
+}
+
+// TestCounterRefillAfterWindowExpiry verifies that the token bucket refills
+// continuously: after exhausting the limit, waiting longer than the window
+// restores the full quota and new requests are accepted again.
+// A 150 ms window is used so the test completes in well under a second.
+func TestCounterRefillAfterWindowExpiry(t *testing.T) {
+	const window = 150 * time.Millisecond
+
+	store := storage.NewMemoryStore()
+	defer store.Close()
+
+	rl := service.NewRateLimiter()
+	pm := service.NewPolicyMatcher([]*models.ClientPolicy{
+		{
+			ClientID: "reset-client",
+			Routes: []models.RoutePolicy{
+				{
+					Route:      "/api/limited",
+					RouteType:  models.RouteExact,
+					Method:     "GET",
+					Limit:      2,
+					Window:     window,
+					Identifier: models.IdentifierNone,
+				},
+			},
+		},
+	})
+	h := handler.New(rl, pm, store, observability.NewNoopMetrics())
+
+	r := gin.New()
+	r.Use(handler.RequestID())
+	h.RegisterRoutes(r)
+
+	req := checkReq{ClientID: "reset-client", Route: "/api/limited", Method: "GET"}
+
+	// Exhaust the 2-token bucket.
+	code, _ := doCheck(r, req)
+	require.Equal(t, http.StatusOK, code, "1st request must be allowed")
+	code, _ = doCheck(r, req)
+	require.Equal(t, http.StatusOK, code, "2nd request must be allowed")
+	code, _ = doCheck(r, req)
+	require.Equal(t, http.StatusTooManyRequests, code, "3rd request must be denied — bucket exhausted")
+
+	// Wait for a full window so the bucket has fully refilled.
+	time.Sleep(window + 50*time.Millisecond)
+
+	// Tokens have been continuously refilling; the bucket should be full again.
+	code, resp := doCheck(r, req)
+	assert.Equal(t, http.StatusOK, code, "request must be allowed after counter reset")
+	assert.Equal(t, int64(1), resp.Remaining, "one token consumed, one remaining")
 }
