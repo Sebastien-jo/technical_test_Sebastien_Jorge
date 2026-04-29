@@ -15,7 +15,7 @@ jobs:
     needs: pr-checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: docker/setup-buildx-action@v3
 
@@ -61,7 +61,7 @@ jobs:
     env:
       COMPOSE_PROJECT_NAME: rate-limiter-ci
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build app image
         run: make build
