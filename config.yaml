@@ -8,3 +8,59 @@ redis:
   db: 0
 
 policies:
+  - client_id: partner
+    routes:
+      - route: /api/videos
+        route_type: prefix
+        method: GET
+        limit: 2000
+        window: 1m
+        identifier: none
+      - route: /api/content
+        route_type: prefix
+        method: "*"
+        limit: 500
+        window: 1m
+        identifier: none
+  - client_id: application
+    routes:
+      - route: /api/videos
+        route_type: prefix
+        method: "*"
+        limit: 100
+        window: 1m
+        identifier: session_id
+      - route: /api/users
+        route_type: exact
+        method: GET
+        limit: 10
+        window: 1m
+        identifier: none
+      - route: /api/payment
+        route_type: exact
+        method: POST
+        limit: 5
+        window: 1m
+        identifier: ip
+  - client_id: internal_service
+    routes:
+      - route: /
+        route_type: prefix
+        method: "*"
+        limit: 10000
+        window: 1m
+        identifier: none
+  - client_id: api_consumer
+    routes:
+      - route: /api/videos
+        route_type: prefix
+        method: "*"
+        limit: 100
+        window: 1m
+        identifier: ip_user_agent
+      - route: /api
+        route_type: prefix
+        method: GET
+        limit: 300
+        window: 1m
+        identifier: ip

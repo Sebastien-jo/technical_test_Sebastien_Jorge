@@ -5,41 +5,66 @@ A production-ready HTTP rate limiting service built in Go with Redis storage and
 ## Architecture
 
 ```
-cmd/       — entrypoint
+cmd/server/         — entrypoint, wires all layers
 internal/
-  models/         — domain types
-  service/        — business logic
-  storage/        — Redis + in-memory backends
-  handler/        — HTTP handlers (Gin)
-tests/            — integration tests
+  config/           — Viper config loading, policy deserialization
+  models/           — domain types (no framework dependencies)
+  service/          — Token Bucket algorithm, policy matching
+  storage/          — Redis + in-memory backends, hybrid fallback
+  handler/          — HTTP handlers and middleware (Gin)
+tests/              — integration tests + K6 load test scripts
+scripts/            — helper shell scripts
 ```
 
-## Quick Start
+## Endpoints
 
-### With Docker Compose
+| Method | Path                    | Description                              |
+|--------|-------------------------|------------------------------------------|
+| POST   | /check                  | Check if a request is within quota       |
+| GET    | /policies               | List all configured client IDs           |
+| GET    | /policies/:client_id    | Inspect routes and limits for one client |
+| GET    | /health                 | Storage health check                     |
+
+### POST /check
+
+```json
+{
+  "client_id":  "mobile_app",
+  "route":      "/api/videos/123",
+  "method":     "GET",
+  "session_id": "user-session-abc",
+  "ip":         "1.2.3.4",
+  "user_agent": "Mozilla/5.0"
+}
+```
+
+Response `200`:
+```json
+{ "allowed": true, "remaining": 99, "reset_time": 1700000060 }
+```
+
+Response `429`:
+```json
+{ "allowed": false, "remaining": 0, "retry_after": 12, "message": "rate limit exceeded" }
+```
+
+Rate-limit headers are set on every response:
+- `X-RateLimit-Limit` — configured limit for the matched route
+- `X-RateLimit-Remaining` — tokens left in the current window
+- `X-RateLimit-Reset` — Unix timestamp when the bucket refills
+- `Retry-After` — seconds to wait (429 only)
+
+## Quick Start
 
 ```bash
 docker compose up --build
 ```
 
-### Locally
-
-```bash
-go mod tidy
-go run ./cmd
-```
-
-The server starts on port `8080` by default.
-
-## Endpoints
-
-| Method | Path      | Description        |
-|--------|-----------|--------------------|
-| GET    | /health   | Health check       |
+The server starts on port `8080`. Redis starts automatically.
 
 ## Configuration
 
-Settings are loaded from `config.yaml` and can be overridden with environment variables (e.g. `REDIS_HOST`, `SERVER_PORT`).
+Settings are loaded from `config.yaml` (overridable via environment variables).
 
 ```yaml
 server:
@@ -50,14 +75,123 @@ redis:
   host: localhost
   port: 6379
   db: 0
+
+policies:
+  - client_id: mobile_app
+    routes:
+      - route: /api/videos
+        route_type: prefix   # "exact" or "prefix"
+        method: "*"          # HTTP method or "*" for all
+        limit: 100
+        window: 1m
+        identifier: session_id  # "none" | "session_id" | "ip" | "ip_user_agent"
 ```
 
-## Development
+Environment variable override example: `REDIS_HOST=my-redis SERVER_PORT=9090`.
+
+## Testing
+
+**Prerequisites: Docker + Docker Compose only. Nothing else to install.**
+
+### Option 1 — Make (recommended)
 
 ```bash
-# Run tests
-go test ./...
-
-# Build binary
-go build -o rate-limiter ./cmd/server
+make test-integration   # Go integration tests         (~5s)
+make test-load          # K6 normal load test          (~2min)
+make test-spike         # K6 spike test                (~30s)
+make test-endurance     # K6 endurance test            (~11min)
+make test-all           # All of the above in sequence
+make full-test          # up → test-all → down
 ```
+
+### Option 2 — Bash script
+
+```bash
+chmod +x scripts/run-tests.sh
+./scripts/run-tests.sh integration
+./scripts/run-tests.sh load
+./scripts/run-tests.sh all
+```
+
+### Option 3 — Docker Compose directly
+
+```bash
+# Integration tests (self-contained, no app needed)
+docker compose --profile test run --rm test
+
+# K6 load tests (starts app + redis automatically)
+docker compose --profile load-test run --rm k6-load
+docker compose --profile load-test run --rm k6-spike
+docker compose --profile load-test run --rm k6-endurance
+```
+
+## Test Suites
+
+### Integration tests (`tests/integration_test.go`)
+
+Go end-to-end tests using `httptest` and in-memory storage — no live server required.
+
+Covers:
+- Basic allow / deny / retry-after flow
+- Quota isolation: by client, by route, by identifier (session / IP)
+- Route matching: exact, prefix, wildcard method, method case insensitivity
+- Input validation: missing fields, unknown client, unknown route
+- HTTP headers: `X-Request-ID`, `X-RateLimit-*`, `Retry-After`
+- Policies endpoint: list all clients, inspect routes per client
+- Health endpoint
+- Exact quota exhaustion (11th request denied when limit=10)
+- Concurrent requests: 150 goroutines → exactly 100 allowed, 50 denied
+- Storage persistence across sequential requests
+- Edge cases: burst, invalid JSON, method case fold
+
+Expected: all tests pass in ~2–5 seconds.
+
+### K6 load test (`tests/load_test.js`)
+
+Ramp up 10→100 req/s over 30s, sustain for 1 min, ramp down over 10s.
+
+Thresholds:
+- `p(95) < 500ms`
+- failure rate < 10%
+- rate-limited requests < 50%
+
+### K6 spike test (`tests/load_test_spike.js`)
+
+10s at 50 req/s → 5s spike at 500 req/s → 10s recovery → ramp down.
+
+Relaxed thresholds (`p(99) < 2s`, failure < 20%) to validate resilience under surge.
+
+### K6 endurance test (`tests/load_test_endurance.js`)
+
+Sustained 50 req/s for 10 minutes to surface memory leaks and latency drift.
+
+Same strict thresholds as the normal load test (`p(95) < 500ms`).
+
+## Expected Results
+
+| Test suite   | Duration | Expected outcome                       |
+|--------------|----------|----------------------------------------|
+| Integration  | ~5s      | 100% pass                              |
+| Load         | ~2min    | p95 < 500ms, <10% failures             |
+| Spike        | ~30s     | p99 < 2s, no panics                    |
+| Endurance    | ~11min   | Stable latency, no memory growth       |
+
+## Troubleshooting
+
+**Port 8080 already in use**
+```bash
+make down   # or: docker compose down
+```
+
+**K6 cannot reach the app**
+The K6 containers communicate via the `rate-limiter-net` bridge network using the hostname `app`. Make sure the app is running and healthy:
+```bash
+docker compose ps
+make health
+```
+
+**Go test module download is slow on first run**
+The `go-cache` Docker volume caches downloaded modules. Subsequent runs are fast.
+
+**Redis not available at startup**
+The app automatically falls back to in-memory storage and retries Redis reconnection every 10 seconds.

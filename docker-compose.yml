@@ -27,15 +27,81 @@ services:
       - REDIS_PORT=6379
       - REDIS_DB=0
       - SERVER_PORT=8080
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
     depends_on:
       redis:
         condition: service_healthy
     networks:
       - rate-limiter-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     restart: unless-stopped
+
+  # Go integration tests — use in-memory storage, no live server required.
+  test:
+    image: golang:1.26.1-alpine
+    working_dir: /app
+    volumes:
+      - .:/app
+      - go-cache:/root/go/pkg/mod
+    command: go test -v -timeout 120s ./tests/...
+    profiles:
+      - test
+
+  # K6 load tests — require the app to be healthy before starting.
+  k6-load:
+    image: grafana/k6:latest
+    volumes:
+      - ./tests/load_test.js:/scripts/load_test.js:ro
+    environment:
+      - BASE_URL=http://app:8080
+    command: run /scripts/load_test.js
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - rate-limiter-net
+    profiles:
+      - load-test
+
+  k6-spike:
+    image: grafana/k6:latest
+    volumes:
+      - ./tests/load_test_spike.js:/scripts/load_test_spike.js:ro
+    environment:
+      - BASE_URL=http://app:8080
+    command: run /scripts/load_test_spike.js
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - rate-limiter-net
+    profiles:
+      - load-test
+
+  k6-endurance:
+    image: grafana/k6:latest
+    volumes:
+      - ./tests/load_test_endurance.js:/scripts/load_test_endurance.js:ro
+    environment:
+      - BASE_URL=http://app:8080
+    command: run /scripts/load_test_endurance.js
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - rate-limiter-net
+    profiles:
+      - load-test
 
 volumes:
   redis_data:
+  go-cache:
 
 networks:
   rate-limiter-net:

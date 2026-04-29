@@ -21,6 +21,15 @@ type ClientPolicyResponse struct {
 	Routes   []RoutePolicyResponse `json:"routes"`
 }
 
+type AllClientsResponse struct {
+	Clients []string `json:"clients"`
+}
+
+func (h *Handler) GetAllPolicies(c *gin.Context) {
+	clients := h.policyMatcher.GetAllClients()
+	c.JSON(http.StatusOK, AllClientsResponse{Clients: clients})
+}
+
 func (h *Handler) GetPolicies(c *gin.Context) {
 	clientID := c.Param("client_id")
 

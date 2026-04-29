@@ -18,6 +18,7 @@ func New(rl *service.RateLimiter, pm *service.PolicyMatcher, store storage.Store
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/check", h.Check)
+	r.GET("/policies", h.GetAllPolicies)
 	r.GET("/policies/:client_id", h.GetPolicies)
 	r.GET("/health", h.Health)
 }
