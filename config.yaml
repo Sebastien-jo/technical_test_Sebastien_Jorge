@@ -1,0 +1,10 @@
+server:
+  port: "8080"
+  timeout: 30s
+
+redis:
+  host: localhost
+  port: 6379
+  db: 0
+
+policies:
