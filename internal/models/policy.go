@@ -108,7 +108,7 @@ func (cp *ClientPolicy) FindMatchingRoute(route, method string) *RoutePolicy {
 				return rp
 			}
 		case RoutePrefix:
-			if strings.HasPrefix(route, rp.Route) {
+			if pathPrefixMatches(route, rp.Route) {
 				if bestPrefix == nil || len(rp.Route) > len(bestPrefix.Route) {
 					bestPrefix = rp
 				}
@@ -117,6 +117,18 @@ func (cp *ClientPolicy) FindMatchingRoute(route, method string) *RoutePolicy {
 	}
 
 	return bestPrefix
+}
+
+// pathPrefixMatches reports whether route starts with prefix at a path boundary.
+// "/" matches everything. "/api" matches "/api" and "/api/x" but NOT "/apiv2".
+func pathPrefixMatches(route, prefix string) bool {
+	if prefix == "/" {
+		return true
+	}
+	if !strings.HasPrefix(route, prefix) {
+		return false
+	}
+	return len(route) == len(prefix) || route[len(prefix)] == '/'
 }
 
 func (cp *ClientPolicy) AddRoute(route RoutePolicy) error {
