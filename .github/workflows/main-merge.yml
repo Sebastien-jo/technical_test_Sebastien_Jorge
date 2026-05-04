@@ -27,7 +27,7 @@ jobs:
           tags: rate-limiter:${{ github.sha }}
           outputs: type=docker,dest=/tmp/rate-limiter.tar
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: docker-image-${{ github.sha }}
           path: /tmp/rate-limiter.tar
