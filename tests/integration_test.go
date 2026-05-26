@@ -61,7 +61,7 @@ var testPolicies = []*models.ClientPolicy{
 // The returned cleanup func stops the background goroutine inside MemoryStore.
 func SetupTestApp() (*gin.Engine, func()) {
 	store := storage.NewMemoryStore()
-	rl := service.NewRateLimiter()
+	rl := service.NewRateLimiter(store)
 	pm := service.NewPolicyMatcher(testPolicies)
 	h := handler.New(rl, pm, store, observability.NewNoopMetrics())
 
@@ -613,7 +613,7 @@ func TestCounterRefillAfterWindowExpiry(t *testing.T) {
 	store := storage.NewMemoryStore()
 	defer store.Close()
 
-	rl := service.NewRateLimiter()
+	rl := service.NewRateLimiter(store)
 	pm := service.NewPolicyMatcher([]*models.ClientPolicy{
 		{
 			ClientID: "reset-client",

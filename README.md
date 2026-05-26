@@ -4,7 +4,7 @@
 [![Main Merge](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/main-merge.yml/badge.svg)](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/main-merge.yml)
 [![Nightly Endurance](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/schedule-extended-tests.yml/badge.svg)](https://github.com/sebastien-jorge/rate-limiter/actions/workflows/schedule-extended-tests.yml)
 
-A production-ready HTTP rate limiting service built in Go. It enforces per-client, per-route quotas using a **Token Bucket** algorithm, backed by **Redis** with an **in-memory fallback** that activates automatically when Redis is unavailable.
+A production-ready HTTP rate limiting service built in Go. It enforces per-client, per-route quotas using a **Token Bucket** algorithm, with Redis as the source of truth via an atomic Lua script and an **in-memory fallback** that activates automatically when Redis is unavailable.
 
 ---
 
@@ -30,13 +30,24 @@ A production-ready HTTP rate limiting service built in Go. It enforces per-clien
 
 ## Architecture
 
-The service is structured in strict layers, each with a single responsibility and no knowledge of the layers above it.
+The service is structured in strict layers. Each layer depends only on the layers below it; no upward dependencies.
 
-- **Handler** — parses HTTP requests, validates input, writes responses, and sets headers. It has no rate-limiting logic; it delegates everything to the layers below.
-- **Service** — contains all business logic: policy matching (which rule applies to this request?) and the Token Bucket algorithm (is this request within quota?). It is framework-agnostic and has no HTTP or storage concerns.
-- **Storage** — abstracts state persistence behind a simple interface. The concrete implementation is a hybrid store that writes to Redis and falls back to memory automatically when Redis is unavailable.
-- **Models** — shared domain types (`RoutePolicy`, `ClientPolicy`, `Decision`) and sentinel errors used across all layers. No framework dependencies.
-- **Config** — loads and deserializes `config.yaml` into domain types at startup, then hands them to the service layer. It is only used at boot time.
+```
+cmd/                     entry point — pure wiring, no business logic
+└── internal/
+    ├── config/          loads YAML + env vars into models.* types
+    ├── models/          pure domain types (no framework tags)
+    ├── storage/         Store interface + Redis / Memory / Hybrid implementations
+    ├── service/         RateLimiter + PolicyMatcher (business logic)
+    ├── handler/         Gin HTTP handlers, DTOs, middleware
+    └── observability/   structured logging, DogStatsD metrics, DataDog APM
+```
+
+- **Handler** — parses HTTP requests, validates input, writes responses, sets headers. No rate-limiting logic.
+- **Service** — `RateLimiter.Check()` resolves a request to a bucket key and delegates the atomic check+consume to the storage layer. `PolicyMatcher.FindPolicy()` resolves the active policy (exact match wins, then longest prefix).
+- **Storage** — three-method `Store` interface: `CheckTokenBucket`, `Health`, `Clear`. The hot path runs atomically — Redis via a Lua script, in-memory via a mutex-guarded map.
+- **Models** — domain types (`RoutePolicy`, `Decision`, `RedisConfig`, `QuotaKey`) with no framework tags.
+- **Config** — Viper-backed loader that produces `models.*` types. `cmd/main.go` contains zero Viper calls; the config package is the single boundary between external configuration sources and the rest of the app.
 
 ### Request Flow
 
@@ -44,50 +55,115 @@ The service is structured in strict layers, each with a single responsibility an
 HTTP Request
     │
     ▼
-Middleware (RequestID, Logger)
+Middleware (RequestID, Logger, Metrics)
     │
     ▼
-Handler (parse + validate JSON body)
+Handler.Check  (parse + validate JSON body)
     │
     ▼
 PolicyMatcher.FindPolicy(client_id, route, method)
-    │  ├─ exact match (highest priority)
-    │  └─ longest prefix match
+    │   ├─ exact match (returns on first hit)
+    │   └─ longest prefix match (path-boundary aware)
     │
     ▼
-RateLimiter.Check(client_id, route_policy, identifier)
-    │  └─ TokenBucket.Allow()  ← gets/creates bucket in Store
+RateLimiter.Check(ctx, client_id, route_policy, identifier)
+    │   build key = rl:{client_id}:{method}:{route}:{identifier}
+    │   refillRate = limit / window.Seconds()
+    │   ttl        = 2 × window
     │
     ▼
-Response (200 allowed | 429 limited) + RateLimit headers
+Store.CheckTokenBucket(ctx, key, capacity, refillRate, ttl)
+    │   ├─ Redis path:  EVAL Lua script (atomic refill + consume + persist)
+    │   └─ Memory path: mutex-guarded refill + consume on local bucket
+    │
+    ▼
+Response (200 allowed | 429 limited) + X-RateLimit-* headers
 ```
 
 ---
 
 ## Algorithm
 
-The service uses a **Token Bucket** algorithm with continuous (smooth) refill rather than fixed windows.
+The service uses a **Token Bucket** algorithm with continuous (smooth) refill — no fixed windows, no boundary bursts.
 
-- Each bucket starts full at capacity `limit`.
-- Tokens refill at a constant rate of `limit / window` tokens per second.
-- A request consumes one token. If the bucket is empty the request is denied and the wait time until one token is available is returned as `retry_after`.
-- Buckets are scoped by a composite storage key: `{client_id}:{route}:{method}:{identifier}`.
+- Each bucket starts full at capacity `limit` and refills at `limit / window` tokens per second.
+- A request consumes one token. If the bucket is empty, the request is denied and `retry_after` returns the time until one token is available.
+- Bucket state lives in storage. The Go process holds no in-process counters — restarting the service does not reset quotas.
 
-This approach avoids the burst-at-boundary problem of fixed windows and allows short bursts up to the configured limit.
+### Bucket key format
+
+```
+rl:{client_id}:{method}:{route}:{identifier}
+```
+
+Defined once in `models.QuotaKey.String()` and used identically by service and storage layers, so a Redis key written by one instance is read by every other instance.
+
+### Atomicity guarantees
+
+The "read state → compute refill → consume → write state" sequence is atomic in both backends:
+
+- **Redis** — implemented as a Lua script (`checkBucketScript`) running server-side. Redis blocks all other commands while a script executes, so concurrent callers across N service instances cannot race against the same key. The script uses Redis-side `TIME` rather than the caller's clock to eliminate skew between instances.
+- **Memory** — implemented under a `sync.Mutex` on the bucket map. Concurrent goroutines on the same key serialise correctly.
+
+This matters because rate limiting only works if "1 + 1" never becomes "2 allowed" when the limit is 1. Without atomicity, two instances could each read `tokens=1`, both decide "allowed", and both write `tokens=0` — overshooting the configured limit by 2×.
+
+### TTL and cleanup
+
+Each bucket key carries a TTL of `2 × window` (e.g. a 1-minute policy → 2-minute TTL). Idle buckets are reclaimed automatically:
+
+- **Redis** evicts the hash via `PEXPIRE` when no further checks refresh it.
+- **Memory** has a cleanup goroutine that scans and removes expired entries every minute.
+
+This bounds memory growth at "active clients" rather than "total clients ever seen."
 
 ---
 
 ## Storage
 
-### Hybrid Store
+The `Store` interface is intentionally narrow — three methods covering the only operations the service actually needs:
 
-The `HybridStore` wraps both a Redis store and an in-memory store with automatic failover:
+```go
+type Store interface {
+    CheckTokenBucket(ctx, key, capacity, refillRate, ttl) (BucketResult, error)
+    Health(ctx) error
+    Clear(ctx) error
+}
+```
 
-1. **Normal operation** — all reads/writes go to Redis, enabling shared state across multiple service instances.
-2. **Redis failure** — on any Redis error, the store transparently switches to in-memory and starts a background reconnect loop that retries every 10 seconds.
-3. **Redis recovery** — once Redis is reachable again the store switches back automatically; no restart required.
+Three implementations satisfy it:
 
-The `/health` endpoint reflects the current storage status.
+| Implementation | Atomicity | Where state lives | Use |
+|---|---|---|---|
+| `RedisStore` | Server-side Lua | Redis hash per bucket key | Production / multi-instance |
+| `MemoryStore` | `sync.Mutex` | Go map in-process | Tests, fallback target |
+| `HybridStore` | Delegates | Redis primary, memory fallback | The wired-up default |
+
+### What Redis stores
+
+Each bucket is a Redis hash:
+
+```
+HKEY: rl:{client_id}:{method}:{route}:{identifier}
+  tokens          -> "1842.5"        (float, stringified for precision)
+  last_refill_ms  -> "1735632000123" (Redis-side TIME at last update)
+TTL: 2 × policy.window
+```
+
+The Lua script reads both fields, computes refill, decrements, writes the new state, and resets the TTL — all in a single atomic operation per request.
+
+### Hybrid failover
+
+`HybridStore` wraps `RedisStore` and `MemoryStore`. Failover is invisible to the service layer:
+
+1. **Normal operation** — all reads/writes go to Redis; the memory store is idle.
+2. **Redis failure** — first error trips `onRedisFailure` (CAS-guarded so only one transition fires), the store flips to memory mode, and a reconnect goroutine starts ticking every 10s. The failing request is served from memory rather than failing — no 5xx is returned.
+3. **Redis recovery** — the reconnect goroutine sees a healthy ping, swaps in the new client, and flips back to Redis mode. The transition is atomic from the caller's perspective.
+
+### Trade-offs during fallback
+
+- **Per-instance limiting** — each replica enforces the limit against its own in-memory map. With N replicas, effective throughput can briefly reach N × the configured limit during an outage. Acceptable for soft API quotas; not appropriate for billing-grade enforcement.
+- **No state migration on transition** — in-memory state is silently abandoned when Redis comes back. Token bucket's continuous refill mostly hides this (the bucket would have refilled during the outage anyway), but for short outages with heavy bursts there can be measurable over-allowance.
+- **Fail-open on storage error** — if `CheckTokenBucket` itself returns an error (rare — only when both Redis and memory fail), the service logs `ERROR` and allows the request rather than rejecting it. The rate limiter must not become a single point of failure for the API it protects.
 
 ---
 
@@ -374,7 +450,7 @@ No body, no parameters.
 }
 ```
 
-> **Note:** A `degraded` storage response means Redis is unreachable. The service continues operating using the in-memory fallback. Existing rate-limit state is preserved in memory, but will not be shared across multiple instances until Redis recovers.
+> **Note:** A `degraded` storage response is returned when the Redis ping itself fails at the moment of the health check. When `HybridStore` has already flipped to memory fallback and the reconnect loop is running, the health endpoint currently reports `ok` since the service is still serving traffic correctly. Watch the structured logs for `[storage] Redis ... fallback` entries (or wire up a metric on `usingMem`) to alert on degraded mode while still using `/health` as a liveness probe.
 
 | Field     | Type   | Values              | Description                   |
 |-----------|--------|---------------------|-------------------------------|
@@ -434,17 +510,25 @@ The `identifier` field on a route policy controls how requests are bucketed — 
 
 ## Configuration
 
-Settings are loaded from `config.yaml`. Any key can be overridden with an environment variable using the `SCREAMING_SNAKE_CASE` equivalent (e.g. `REDIS_HOST`, `SERVER_PORT`).
+Settings are loaded by `internal/config/`. Resolution order, highest priority first:
+
+1. Environment variable (e.g. `REDIS_HOST` overrides `redis.host`)
+2. `config.yaml` in the working directory or `/app`
+3. Built-in defaults
+
+Missing config file is **not** an error — defaults + env vars are sufficient to boot.
 
 ```yaml
 server:
-  port: "8080"     # listening port
-  timeout: 30s     # graceful shutdown timeout
+  port: 8080       # listening port (int)
+  timeout: 30s     # read/write timeout (Go duration)
 
 redis:
   host: localhost
   port: 6379
   db: 0
+  password: ""     # set via REDIS_PASSWORD env var
+  tls: false       # set REDIS_TLS=true for ElastiCache in-transit encryption
 
 policies:
   - client_id: mobile_app
@@ -461,7 +545,7 @@ policies:
         method: POST
         limit: 10
         window: 1h
-        identifier: ip
+        identifier: ip_user_agent
 
   - client_id: web_app
     routes:
@@ -475,12 +559,27 @@ policies:
 
 ### Environment variable overrides
 
-| Variable      | Config key    | Example         |
-|---------------|---------------|-----------------|
-| `SERVER_PORT` | `server.port` | `SERVER_PORT=9090` |
-| `REDIS_HOST`  | `redis.host`  | `REDIS_HOST=my-redis` |
-| `REDIS_PORT`  | `redis.port`  | `REDIS_PORT=6380` |
-| `REDIS_DB`    | `redis.db`    | `REDIS_DB=1` |
+| Variable          | Config key       | Example                  |
+|-------------------|------------------|--------------------------|
+| `SERVER_PORT`     | `server.port`    | `SERVER_PORT=9090`       |
+| `SERVER_TIMEOUT`  | `server.timeout` | `SERVER_TIMEOUT=15s`     |
+| `REDIS_HOST`      | `redis.host`     | `REDIS_HOST=redis`       |
+| `REDIS_PORT`      | `redis.port`     | `REDIS_PORT=6380`        |
+| `REDIS_DB`        | `redis.db`       | `REDIS_DB=1`             |
+| `REDIS_PASSWORD`  | `redis.password` | `REDIS_PASSWORD=s3cret`  |
+| `REDIS_TLS`       | `redis.tls`      | `REDIS_TLS=true`         |
+
+> Env vars use `_` as the separator; Viper maps `redis.host` → `REDIS_HOST` via a key replacer registered in `config.Load()`.
+
+### Observability environment variables
+
+| Variable          | Effect                                                    |
+|-------------------|-----------------------------------------------------------|
+| `DD_AGENT_HOST`   | Enables DogStatsD metrics and DataDog APM tracing         |
+| `DD_ENV`          | DataDog `env` tag (e.g. `production`, `staging`)          |
+| `DD_VERSION`      | DataDog `version` tag for the running build               |
+
+When `DD_AGENT_HOST` is unset, metrics and tracing are no-ops — the service starts cleanly with no external dependencies.
 
 ---
 
@@ -552,21 +651,34 @@ docker compose --profile load-test run --rm k6-endurance
 
 ## Test Suites
 
+### Unit tests (`internal/...`)
+
+Layer-isolated tests covering models, config loading, policy matching, the rate limiter wiring, the storage contract (MemoryStore against the same contract suite as RedisStore), and HTTP handlers.
+
+Run with the race detector enabled:
+
+```bash
+go test -race ./internal/...
+```
+
+Storage contract tests against real Redis are gated by reachability — they skip cleanly if `localhost:6379` doesn't answer. To exercise the Lua-script path in CI without a Redis sidecar, you can swap `newRedisStoreOrSkip` for `miniredis.RunT(t)`.
+
 ### Integration tests (`tests/integration_test.go`)
 
-Go end-to-end tests using `httptest` and in-memory storage — no live server or Redis required.
+Go end-to-end tests using `httptest` and a `MemoryStore` — no live server or Redis required.
 
 Covers:
 - Basic allow / deny / retry-after flow
-- Quota isolation: by client, by route, by identifier (session / IP)
+- Quota isolation: by client, by route, by identifier (session / IP + user agent)
 - Route matching: exact, prefix, wildcard method, method case insensitivity
 - Input validation: missing required fields, unknown client, unknown route
 - HTTP headers: `X-Trace-ID`, `X-RateLimit-*`, `Retry-After`
 - Policy endpoints: list all clients, inspect routes per client
 - Health endpoint: ok and degraded states
 - Exact quota exhaustion (11th request denied when limit=10)
-- Concurrent requests: 150 goroutines → exactly 100 allowed, 50 denied
+- Concurrent requests: 150 goroutines → exactly 100 allowed, 50 denied (atomicity test)
 - Storage persistence across sequential requests
+- Counter refill across window expiry
 - Edge cases: burst, invalid JSON, method case fold
 
 Expected: all tests pass in ~2–5 seconds.
@@ -668,4 +780,23 @@ The `go-cache` Docker volume caches downloaded modules. Subsequent runs are fast
 
 **Redis not available at startup**
 
-The app automatically falls back to in-memory storage and retries Redis reconnection every 10 seconds. The `/health` endpoint will report `"storage": "degraded"` while the fallback is active, but the service continues enforcing rate limits.
+The app automatically falls back to in-memory storage and retries Redis reconnection every 10 seconds. The service continues enforcing rate limits during the outage, but each replica enforces against its own in-memory state (effective limit becomes N × configured limit across N replicas).
+
+**`connection refused` to `[::1]:6379` from inside the container**
+
+The app is dialling `localhost` from inside its container, ignoring `REDIS_HOST=redis`. This means env-var resolution isn't reaching Viper. Confirm:
+- `REDIS_HOST` is actually exported in the container (`docker compose exec app env | grep REDIS`)
+- `config.Load()` registers the key replacer (`SetEnvKeyReplacer(strings.NewReplacer(".", "_"))`); without it Viper looks for `REDIS.HOST` which can never exist in POSIX env
+
+**Verifying Redis is the source of truth**
+
+```bash
+# Hit /check, then look at what Redis stores:
+docker compose exec redis redis-cli KEYS 'rl:*'
+docker compose exec redis redis-cli HGETALL rl:rl:partner:GET:/api/videos:global
+# Should show "tokens" and "last_refill_ms" — proving the Lua script ran.
+
+# Restart only the app and confirm the bucket survives:
+docker compose restart app
+# Send another /check, Remaining should pick up where it left off, not reset.
+```

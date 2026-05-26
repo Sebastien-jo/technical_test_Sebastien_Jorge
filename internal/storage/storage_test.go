@@ -3,107 +3,68 @@ package storage
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/sebastien-jorge/rate-limiter/internal/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// testStore runs the full Store contract against any implementation.
-// Add new store types by writing a small factory function and calling testStore.
+// testStore runs the Store contract against any implementation. Add new stores
+// by writing a small factory and calling testStore with it.
 func testStore(t *testing.T, s Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	t.Run("Set_and_Get", func(t *testing.T) {
-		require.NoError(t, s.Set(ctx, "k1", 42, time.Minute))
-
-		val, err := s.Get(ctx, "k1")
+	t.Run("CheckTokenBucket_AllowsFirstRequest", func(t *testing.T) {
+		require.NoError(t, s.Clear(ctx))
+		res, err := s.CheckTokenBucket(ctx, "first", 10, 1.0, time.Minute)
 		require.NoError(t, err)
-		assert.Equal(t, int64(42), val)
+		assert.True(t, res.Allowed)
+		assert.Equal(t, int64(9), res.Remaining)
+		assert.Zero(t, res.RetryAfter)
 	})
 
-	t.Run("Get_missing_key_returns_zero", func(t *testing.T) {
-		val, err := s.Get(ctx, "does-not-exist")
-		require.NoError(t, err)
-		assert.Equal(t, int64(0), val)
-	})
-
-	t.Run("Set_overwrites_existing_value", func(t *testing.T) {
-		require.NoError(t, s.Set(ctx, "overwrite", 1, time.Minute))
-		require.NoError(t, s.Set(ctx, "overwrite", 99, time.Minute))
-
-		val, err := s.Get(ctx, "overwrite")
-		require.NoError(t, err)
-		assert.Equal(t, int64(99), val)
-	})
-
-	t.Run("Increment_creates_key_at_delta", func(t *testing.T) {
-		val, err := s.Increment(ctx, "new-counter", 5, time.Minute)
-		require.NoError(t, err)
-		assert.Equal(t, int64(5), val)
-	})
-
-	t.Run("Increment_accumulates", func(t *testing.T) {
-		key := "accum"
-		for i := int64(1); i <= 5; i++ {
-			val, err := s.Increment(ctx, key, 1, time.Minute)
+	t.Run("CheckTokenBucket_DeniesWhenExhausted", func(t *testing.T) {
+		require.NoError(t, s.Clear(ctx))
+		for i := 0; i < 3; i++ {
+			_, err := s.CheckTokenBucket(ctx, "exhaust", 3, 1.0, time.Minute)
 			require.NoError(t, err)
-			assert.Equal(t, i, val)
 		}
-	})
-
-	t.Run("Increment_by_arbitrary_delta", func(t *testing.T) {
-		val, err := s.Increment(ctx, "delta-key", 10, time.Minute)
+		res, err := s.CheckTokenBucket(ctx, "exhaust", 3, 1.0, time.Minute)
 		require.NoError(t, err)
-		assert.Equal(t, int64(10), val)
+		assert.False(t, res.Allowed)
+		assert.Equal(t, int64(0), res.Remaining)
+		assert.Positive(t, res.RetryAfter)
+	})
 
-		val, err = s.Increment(ctx, "delta-key", 7, time.Minute)
+	t.Run("CheckTokenBucket_SeparateKeysAreIndependent", func(t *testing.T) {
+		require.NoError(t, s.Clear(ctx))
+		a, err := s.CheckTokenBucket(ctx, "key-A", 1, 1.0, time.Minute)
 		require.NoError(t, err)
-		assert.Equal(t, int64(17), val)
-	})
-
-	t.Run("Exists_true_for_live_key", func(t *testing.T) {
-		require.NoError(t, s.Set(ctx, "exists-key", 1, time.Minute))
-
-		ok, err := s.Exists(ctx, "exists-key")
+		b, err := s.CheckTokenBucket(ctx, "key-B", 1, 1.0, time.Minute)
 		require.NoError(t, err)
-		assert.True(t, ok)
+		assert.True(t, a.Allowed)
+		assert.True(t, b.Allowed)
 	})
 
-	t.Run("Exists_false_for_missing_key", func(t *testing.T) {
-		ok, err := s.Exists(ctx, "ghost")
+	t.Run("Clear_RemovesBuckets", func(t *testing.T) {
+		_, err := s.CheckTokenBucket(ctx, "to-clear", 1, 1.0, time.Minute)
 		require.NoError(t, err)
-		assert.False(t, ok)
-	})
 
-	t.Run("Delete_removes_key", func(t *testing.T) {
-		require.NoError(t, s.Set(ctx, "del-key", 1, time.Minute))
-		require.NoError(t, s.Delete(ctx, "del-key"))
-
-		ok, err := s.Exists(ctx, "del-key")
-		require.NoError(t, err)
-		assert.False(t, ok)
-	})
-
-	t.Run("Delete_missing_key_is_no_op", func(t *testing.T) {
-		assert.NoError(t, s.Delete(ctx, "no-such-key"))
-	})
-
-	t.Run("Clear_removes_all_keys", func(t *testing.T) {
-		require.NoError(t, s.Set(ctx, "c1", 1, time.Minute))
-		require.NoError(t, s.Set(ctx, "c2", 2, time.Minute))
 		require.NoError(t, s.Clear(ctx))
 
-		for _, k := range []string{"c1", "c2"} {
-			val, err := s.Get(ctx, k)
-			require.NoError(t, err)
-			assert.Zero(t, val, "key %q should be cleared", k)
-		}
+		// After clearing, the bucket starts fresh — a single request consumes
+		// from a full bucket, so Remaining drops from capacity to capacity-1.
+		res, err := s.CheckTokenBucket(ctx, "to-clear", 5, 1.0, time.Minute)
+		require.NoError(t, err)
+		assert.True(t, res.Allowed)
+		assert.Equal(t, int64(4), res.Remaining)
 	})
 
-	t.Run("Health_returns_nil", func(t *testing.T) {
+	t.Run("Health_ReturnsNil", func(t *testing.T) {
 		assert.NoError(t, s.Health(ctx))
 	})
 }
@@ -114,68 +75,72 @@ func TestMemoryStore_Contract(t *testing.T) {
 	testStore(t, ms)
 }
 
-func TestMemoryStore_TTLExpiry(t *testing.T) {
+func TestMemoryStore_BucketTTLExpiry(t *testing.T) {
 	ms := NewMemoryStore()
 	defer ms.Close()
 	ctx := context.Background()
 
-	require.NoError(t, ms.Set(ctx, "short", 42, 100*time.Millisecond))
-
-	ok, err := ms.Exists(ctx, "short")
+	// First call: consume 1 token from a bucket with capacity 5.
+	_, err := ms.CheckTokenBucket(ctx, "expiring", 5, 1.0, 50*time.Millisecond)
 	require.NoError(t, err)
-	assert.True(t, ok)
 
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
-	ok, err = ms.Exists(ctx, "short")
+	// After the TTL, the bucket should be discarded and the next call should
+	// see a fresh, full bucket — Remaining is capacity-1 (=4), not 3.
+	res, err := ms.CheckTokenBucket(ctx, "expiring", 5, 1.0, 50*time.Millisecond)
 	require.NoError(t, err)
-	assert.False(t, ok, "key should have expired")
-
-	val, err := ms.Get(ctx, "short")
-	require.NoError(t, err)
-	assert.Zero(t, val, "expired key should return 0")
+	assert.Equal(t, int64(4), res.Remaining, "expired bucket must start fresh")
 }
 
-func TestMemoryStore_IncrementOnExpiredKey_StartsFromZero(t *testing.T) {
+func TestMemoryStore_PurgeExpired_DropsIdleBuckets(t *testing.T) {
 	ms := NewMemoryStore()
 	defer ms.Close()
 	ctx := context.Background()
 
-	_, err := ms.Increment(ctx, "exp-incr", 10, 100*time.Millisecond)
+	_, err := ms.CheckTokenBucket(ctx, "stale", 1, 1.0, time.Nanosecond)
 	require.NoError(t, err)
 
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	ms.purgeExpired()
 
-	// Expired key — increment should restart from 0.
-	val, err := ms.Increment(ctx, "exp-incr", 3, time.Minute)
-	require.NoError(t, err)
-	assert.Equal(t, int64(3), val, "should restart from 0 after expiry, not add to 10")
+	ms.mu.Lock()
+	_, present := ms.buckets["stale"]
+	ms.mu.Unlock()
+	assert.False(t, present, "expired bucket must be removed by purgeExpired")
 }
 
-func TestMemoryStore_ConcurrentIncrement_IsAtomic(t *testing.T) {
+func TestMemoryStore_CheckTokenBucket_Concurrent(t *testing.T) {
 	ms := NewMemoryStore()
 	defer ms.Close()
 	ctx := context.Background()
 
-	const goroutines = 50
-	var wg sync.WaitGroup
+	const capacity = 100
+	const goroutines = 150
+
+	var (
+		wg      sync.WaitGroup
+		allowed atomic.Int64
+	)
 	for range goroutines {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = ms.Increment(ctx, "race-key", 1, time.Minute)
+			res, err := ms.CheckTokenBucket(ctx, "shared", capacity, 1.0, time.Minute)
+			require.NoError(t, err)
+			if res.Allowed {
+				allowed.Add(1)
+			}
 		}()
 	}
 	wg.Wait()
 
-	val, err := ms.Get(ctx, "race-key")
-	require.NoError(t, err)
-	assert.Equal(t, int64(goroutines), val, "each goroutine contributes exactly 1")
+	assert.Equal(t, int64(capacity), allowed.Load(), "exactly capacity requests must be allowed under contention")
 }
 
 func newRedisStoreOrSkip(t *testing.T) *RedisStore {
 	t.Helper()
-	s, err := NewRedisStore("localhost", 6379, 15, "", false, "test:rl:")
+	s, err := NewRedisStore(models.RedisConfig{Host: "localhost", Port: 6379, DB: 15}, "test:rl:")
 	if err != nil {
 		t.Skipf("Redis not available: %v", err)
 	}
@@ -190,57 +155,40 @@ func TestRedisStore_Contract(t *testing.T) {
 	testStore(t, newRedisStoreOrSkip(t))
 }
 
-func TestRedisStore_TTLExpiry(t *testing.T) {
+func TestRedisStore_BucketTTLExpiry(t *testing.T) {
 	s := newRedisStoreOrSkip(t)
 	ctx := context.Background()
 
-	require.NoError(t, s.Set(ctx, "ttl-key", 1, 100*time.Millisecond))
-	time.Sleep(200 * time.Millisecond)
-
-	val, err := s.Get(ctx, "ttl-key")
+	_, err := s.CheckTokenBucket(ctx, "ttl-bucket", 5, 1.0, 100*time.Millisecond)
 	require.NoError(t, err)
-	assert.Zero(t, val, "key should have expired in Redis")
-}
 
-func TestHybridStore_MemoryFallbackWhenRedisDown(t *testing.T) {
-	// Point to a port with nothing listening → forces memory fallback.
-	hs, err := NewHybridStore("localhost", 19999, 0, "", false, "test:")
-	require.NoError(t, err, "NewHybridStore should never return an error")
-	defer hs.Close()
+	time.Sleep(250 * time.Millisecond)
 
-	assert.True(t, hs.UsingMemoryFallback(), "should be in memory mode")
-
-	ctx := context.Background()
-	require.NoError(t, hs.Set(ctx, "k", 7, time.Minute))
-
-	val, err := hs.Get(ctx, "k")
+	res, err := s.CheckTokenBucket(ctx, "ttl-bucket", 5, 1.0, 100*time.Millisecond)
 	require.NoError(t, err)
-	assert.Equal(t, int64(7), val)
+	assert.Equal(t, int64(4), res.Remaining, "expired bucket must start fresh in Redis")
 }
 
 func TestHybridStore_Contract_MemoryMode(t *testing.T) {
-	hs, err := NewHybridStore("localhost", 19999, 0, "", false, "test:")
+	// Pointing at a closed port forces immediate fallback into memory mode.
+	hs, err := NewHybridStore(models.RedisConfig{Host: "localhost", Port: 19999}, "test:")
 	require.NoError(t, err)
 	defer hs.Close()
+
+	require.True(t, hs.UsingMemoryFallback())
 	testStore(t, hs)
 }
 
-func TestMemoryStore_PurgeExpired(t *testing.T) {
-	ms := NewMemoryStore()
-	defer ms.Close()
+func TestHybridStore_FallbackServesTraffic(t *testing.T) {
+	hs, err := NewHybridStore(models.RedisConfig{Host: "localhost", Port: 19999}, "test:")
+	require.NoError(t, err, "constructor must not fail when Redis is unreachable")
+	defer hs.Close()
+
+	assert.True(t, hs.UsingMemoryFallback(), "store should be in memory mode")
 
 	ctx := context.Background()
-	require.NoError(t, ms.Set(ctx, "alive", 1, time.Hour))
-	require.NoError(t, ms.Set(ctx, "dead", 2, time.Nanosecond))
-
-	time.Sleep(5 * time.Millisecond)
-	ms.purgeExpired()
-
-	val, err := ms.Get(ctx, "alive")
+	res, err := hs.CheckTokenBucket(ctx, "fallback-key", 3, 1.0, time.Minute)
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), val, "non-expired key must survive purge")
-
-	val, err = ms.Get(ctx, "dead")
-	require.NoError(t, err)
-	assert.Equal(t, int64(0), val, "expired key must be removed by purge")
+	assert.True(t, res.Allowed)
+	assert.Equal(t, int64(2), res.Remaining)
 }

@@ -1,79 +1,51 @@
 package service
 
 import (
-	"sync"
+	"context"
+	"log/slog"
+	"time"
 
 	"github.com/sebastien-jorge/rate-limiter/internal/models"
+	"github.com/sebastien-jorge/rate-limiter/internal/storage"
 )
 
 type RateLimiter struct {
-	mu      sync.RWMutex
-	buckets map[string]*TokenBucket
+	store storage.Store
 }
 
-func NewRateLimiter() *RateLimiter {
-	return &RateLimiter{
-		buckets: make(map[string]*TokenBucket),
-	}
+func NewRateLimiter(store storage.Store) *RateLimiter {
+	return &RateLimiter{store: store}
 }
 
-func (rl *RateLimiter) Check(clientID string, policy *models.RoutePolicy, identifier string) *models.Decision {
+func (rl *RateLimiter) Check(ctx context.Context, clientID string, policy *models.RoutePolicy, identifier string) *models.Decision {
 	if identifier == "" {
 		identifier = "global"
 	}
 
 	key := rl.buildKey(clientID, policy, identifier)
-	bucket := rl.getOrCreate(key, policy)
+	refillRate := float64(policy.Limit) / policy.Window.Seconds()
+	ttl := 2 * policy.Window
 
-	allowed, remaining, retryAfter := bucket.Allow(1)
+	res, err := rl.store.CheckTokenBucket(ctx, key, policy.Limit, refillRate, ttl)
+	if err != nil {
+		slog.Error("rate limiter storage failure, failing open", "key", key, "error", err)
+		return &models.Decision{
+			Allowed:   true,
+			Remaining: policy.Limit,
+			ResetTime: time.Now().Add(policy.Window),
+		}
+	}
 
 	decision := &models.Decision{
-		Allowed:   allowed,
-		Remaining: remaining,
-		ResetTime: bucket.GetResetTime(),
+		Allowed:   res.Allowed,
+		Remaining: res.Remaining,
+		ResetTime: time.Now().Add(res.ResetAfter),
 	}
-	if !allowed {
-		decision.RetryAfter = retryAfter
+	if !res.Allowed {
+		decision.RetryAfter = res.RetryAfter
 		decision.Message = "rate limit exceeded"
 	}
 	return decision
-}
-
-func (rl *RateLimiter) GetStats() map[string]int64 {
-	rl.mu.RLock()
-	defer rl.mu.RUnlock()
-
-	stats := make(map[string]int64, len(rl.buckets))
-	for key, bucket := range rl.buckets {
-		stats[key] = bucket.GetRemaining()
-	}
-	return stats
-}
-
-// Reset clears all in-memory buckets. Intended for tests only.
-func (rl *RateLimiter) Reset() {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	rl.buckets = make(map[string]*TokenBucket)
-}
-
-func (rl *RateLimiter) getOrCreate(key string, policy *models.RoutePolicy) *TokenBucket {
-	rl.mu.RLock()
-	if bucket, ok := rl.buckets[key]; ok {
-		rl.mu.RUnlock()
-		return bucket
-	}
-	rl.mu.RUnlock()
-
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	// Re-check: another goroutine may have created the bucket between the two locks.
-	if bucket, ok := rl.buckets[key]; ok {
-		return bucket
-	}
-	bucket := NewTokenBucket(policy.Limit, policy.Window)
-	rl.buckets[key] = bucket
-	return bucket
 }
 
 func (rl *RateLimiter) buildKey(clientID string, policy *models.RoutePolicy, identifier string) string {

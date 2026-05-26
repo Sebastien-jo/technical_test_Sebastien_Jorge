@@ -21,6 +21,7 @@ type RedisConfig struct {
 	Port     int
 	Password string
 	DB       int
+	TLS      bool
 }
 
 func (rc RedisConfig) Addr() string {

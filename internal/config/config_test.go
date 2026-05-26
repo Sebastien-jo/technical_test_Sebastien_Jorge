@@ -2,12 +2,75 @@ package config
 
 import (
 	"testing"
+	"time"
 
 	"github.com/sebastien-jorge/rate-limiter/internal/models"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// ── LoadRedisConfig / LoadServerConfig ────────────────────────────────────────
+
+func TestLoadRedisConfig_FromViper(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+
+	viper.Set("redis.host", "redis.internal")
+	viper.Set("redis.port", 6380)
+	viper.Set("redis.db", 3)
+	viper.Set("redis.password", "secret")
+	viper.Set("redis.tls", true)
+
+	cfg := LoadRedisConfig()
+	assert.Equal(t, "redis.internal", cfg.Host)
+	assert.Equal(t, 6380, cfg.Port)
+	assert.Equal(t, 3, cfg.DB)
+	assert.Equal(t, "secret", cfg.Password)
+	assert.True(t, cfg.TLS)
+}
+
+func TestLoadRedisConfig_DefaultsAfterLoad(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	require.NoError(t, Load())
+
+	cfg := LoadRedisConfig()
+	assert.Equal(t, "localhost", cfg.Host)
+	assert.Equal(t, 6379, cfg.Port)
+	assert.Equal(t, 0, cfg.DB)
+	assert.Empty(t, cfg.Password)
+	assert.False(t, cfg.TLS)
+}
+
+func TestLoadServerConfig_FromViper(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+
+	viper.Set("server.port", 9090)
+	viper.Set("server.timeout", "15s")
+
+	cfg := LoadServerConfig()
+	assert.Equal(t, 9090, cfg.Port)
+	assert.Equal(t, 15*time.Second, cfg.Timeout)
+}
+
+func TestLoadServerConfig_DefaultsAfterLoad(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	require.NoError(t, Load())
+
+	cfg := LoadServerConfig()
+	assert.Equal(t, 8080, cfg.Port)
+	assert.Equal(t, 30*time.Second, cfg.Timeout)
+}
+
+func TestLoad_MissingFileReturnsNil(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	// No config file in CWD — Load must not error out.
+	assert.NoError(t, Load())
+}
 
 func validRouteConfig() RouteConfig {
 	return RouteConfig{

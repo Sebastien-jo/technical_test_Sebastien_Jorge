@@ -4,18 +4,55 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/sebastien-jorge/rate-limiter/internal/models"
 )
 
-// incrWithExpire is a Lua script that atomically increments a key by delta
-// and sets its TTL in milliseconds. Unlike a pipeline, a Lua script runs
-// as a single unit on the Redis server — no other command can interleave.
-var incrWithExpire = redis.NewScript(`
-local v = redis.call('INCRBY', KEYS[1], ARGV[1])
-redis.call('PEXPIRE', KEYS[1], ARGV[2])
-return v
+var checkBucketScript = redis.NewScript(`
+local key         = KEYS[1]
+local capacity    = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local ttl_ms      = tonumber(ARGV[3])
+
+local t = redis.call('TIME')
+local now_ms = t[1] * 1000 + math.floor(t[2] / 1000)
+
+local data = redis.call('HMGET', key, 'tokens', 'last_refill_ms')
+local tokens         = tonumber(data[1])
+local last_refill_ms = tonumber(data[2])
+
+if tokens == nil then
+    tokens = capacity
+    last_refill_ms = now_ms
+end
+
+local elapsed_sec = (now_ms - last_refill_ms) / 1000.0
+if elapsed_sec > 0 then
+    tokens = math.min(capacity, tokens + elapsed_sec * refill_rate)
+end
+
+local allowed = 0
+local retry_after_ms = 0
+if tokens >= 1 then
+    tokens = tokens - 1
+    allowed = 1
+else
+    retry_after_ms = math.ceil((1 - tokens) / refill_rate * 1000)
+end
+
+local deficit = capacity - tokens
+local reset_after_ms = 0
+if deficit > 0 then
+    reset_after_ms = math.ceil(deficit / refill_rate * 1000)
+end
+
+redis.call('HSET', key, 'tokens', tostring(tokens), 'last_refill_ms', tostring(now_ms))
+redis.call('PEXPIRE', key, ttl_ms)
+
+return {allowed, math.floor(tokens), retry_after_ms, reset_after_ms}
 `)
 
 type RedisStore struct {
@@ -23,14 +60,14 @@ type RedisStore struct {
 	prefix string
 }
 
-func NewRedisStore(host string, port, db int, password string, tlsEnabled bool, prefix string) (*RedisStore, error) {
+func NewRedisStore(cfg models.RedisConfig, prefix string) (*RedisStore, error) {
 	opts := &redis.Options{
-		Addr:     fmt.Sprintf("%s:%d", host, port),
-		DB:       db,
-		Password: password,
+		Addr:     cfg.Addr(),
+		DB:       cfg.DB,
+		Password: cfg.Password,
 		PoolSize: 10,
 	}
-	if tlsEnabled {
+	if cfg.TLS {
 		opts.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
 	client := redis.NewClient(opts)
@@ -52,40 +89,8 @@ func (rs *RedisStore) Close() error {
 
 func (rs *RedisStore) key(k string) string { return rs.prefix + k }
 
-func (rs *RedisStore) Set(ctx context.Context, key string, value int64, ttl time.Duration) error {
-	return rs.client.Set(ctx, rs.key(key), value, ttl).Err()
-}
-
-func (rs *RedisStore) Get(ctx context.Context, key string) (int64, error) {
-	val, err := rs.client.Get(ctx, rs.key(key)).Int64()
-	if err == redis.Nil {
-		return 0, nil
-	}
-	return val, err
-}
-
-func (rs *RedisStore) Increment(ctx context.Context, key string, delta int64, ttl time.Duration) (int64, error) {
-	result, err := incrWithExpire.Run(ctx, rs.client,
-		[]string{rs.key(key)},
-		delta,
-		ttl.Milliseconds(),
-	).Int64()
-	if err != nil {
-		return 0, fmt.Errorf("increment script: %w", err)
-	}
-	return result, nil
-}
-
-func (rs *RedisStore) Delete(ctx context.Context, key string) error {
-	return rs.client.Del(ctx, rs.key(key)).Err()
-}
-
-func (rs *RedisStore) Exists(ctx context.Context, key string) (bool, error) {
-	n, err := rs.client.Exists(ctx, rs.key(key)).Result()
-	if err != nil {
-		return false, err
-	}
-	return n > 0, nil
+func (rs *RedisStore) Health(ctx context.Context) error {
+	return rs.client.Ping(ctx).Err()
 }
 
 func (rs *RedisStore) Clear(ctx context.Context) error {
@@ -108,6 +113,38 @@ func (rs *RedisStore) Clear(ctx context.Context) error {
 	return nil
 }
 
-func (rs *RedisStore) Health(ctx context.Context) error {
-	return rs.client.Ping(ctx).Err()
+func (rs *RedisStore) CheckTokenBucket(ctx context.Context, key string, capacity int64, refillRate float64, ttl time.Duration) (BucketResult, error) {
+	res, err := checkBucketScript.Run(ctx, rs.client,
+		[]string{rs.key(key)},
+		capacity,
+		refillRate,
+		ttl.Milliseconds(),
+	).Slice()
+	if err != nil {
+		return BucketResult{}, fmt.Errorf("check_token_bucket script: %w", err)
+	}
+	if len(res) != 4 {
+		return BucketResult{}, fmt.Errorf("check_token_bucket: unexpected result length %d", len(res))
+	}
+	return BucketResult{
+		Allowed:    luaInt(res[0]) == 1,
+		Remaining:  luaInt(res[1]),
+		RetryAfter: time.Duration(luaInt(res[2])) * time.Millisecond,
+		ResetAfter: time.Duration(luaInt(res[3])) * time.Millisecond,
+	}, nil
+}
+
+// luaInt coerces a value returned by go-redis from a Lua script into int64.
+// Lua integers come back as int64; strings (in case of large values) are parsed.
+func luaInt(v interface{}) int64 {
+	switch n := v.(type) {
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case string:
+		i, _ := strconv.ParseInt(n, 10, 64)
+		return i
+	}
+	return 0
 }

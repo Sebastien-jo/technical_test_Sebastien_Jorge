@@ -8,11 +8,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/spf13/viper"
 	gintrace "gopkg.in/DataDog/dd-trace-go.v1/contrib/gin-gonic/gin"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 
@@ -42,7 +42,7 @@ func run() error {
 	)
 	defer tracer.Stop()
 
-	if err := loadConfig(); err != nil {
+	if err := config.Load(); err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
@@ -62,14 +62,7 @@ func run() error {
 	}
 	defer func() { _ = m.Close() }()
 
-	store, err := storage.NewHybridStore(
-		viper.GetString("redis.host"),
-		viper.GetInt("redis.port"),
-		viper.GetInt("redis.db"),
-		viper.GetString("redis.password"),
-		viper.GetBool("redis.tls"),
-		"rl:",
-	)
+	store, err := storage.NewHybridStore(config.LoadRedisConfig(), "rl:")
 	if err != nil {
 		return fmt.Errorf("create storage: %w", err)
 	}
@@ -79,7 +72,7 @@ func run() error {
 		}
 	}()
 
-	rl := service.NewRateLimiter()
+	rl := service.NewRateLimiter(store)
 	pm := service.NewPolicyMatcher(policies)
 	h := handler.New(rl, pm, store, m)
 
@@ -91,16 +84,16 @@ func run() error {
 	router.Use(handler.MetricsMiddleware(m))
 	h.RegisterRoutes(router)
 
-	port := viper.GetString("server.port")
+	srvCfg := config.LoadServerConfig()
 	srv := &http.Server{
-		Addr:         ":" + port,
+		Addr:         ":" + strconv.Itoa(srvCfg.Port),
 		Handler:      router,
-		ReadTimeout:  viper.GetDuration("server.timeout"),
-		WriteTimeout: viper.GetDuration("server.timeout"),
+		ReadTimeout:  srvCfg.Timeout,
+		WriteTimeout: srvCfg.Timeout,
 	}
 
 	go func() {
-		slog.Info("server listening", "port", port)
+		slog.Info("server listening", "port", srvCfg.Port)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server error", "error", err)
 		}
@@ -118,33 +111,5 @@ func run() error {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	slog.Info("server stopped")
-	return nil
-}
-
-func loadConfig() error {
-	viper.SetConfigName("config")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".")
-	viper.AddConfigPath("/app")
-
-	viper.AutomaticEnv()
-
-	viper.SetDefault("server.port", "8080")
-	viper.SetDefault("server.timeout", "30s")
-	viper.SetDefault("redis.host", "localhost")
-	viper.SetDefault("redis.port", 6379)
-	viper.SetDefault("redis.db", 0)
-	viper.SetDefault("redis.password", "")
-	viper.SetDefault("redis.tls", false)
-
-	if err := viper.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			slog.Info("no config file found, using defaults and environment variables")
-			return nil
-		}
-		return err
-	}
-
-	slog.Info("config loaded", "file", viper.ConfigFileUsed())
 	return nil
 }
