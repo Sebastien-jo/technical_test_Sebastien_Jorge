@@ -52,7 +52,7 @@ func (h *Handler) Check(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	decision := h.rateLimiter.Check(req.ClientID, routePolicy, identifier)
+	decision := h.rateLimiter.Check(c.Request.Context(), req.ClientID, routePolicy, identifier)
 
 	tags := []string{"client_id:" + req.ClientID, "route:" + routePolicy.Route}
 	if decision.Allowed {

@@ -16,7 +16,7 @@ policies:
         route_type: prefix
         method: GET
         limit: 2000
-        window: 1m
+        window: 120m
         identifier: none
       - route: /api/content
         route_type: prefix

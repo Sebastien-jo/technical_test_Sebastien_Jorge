@@ -1,16 +1,24 @@
 package service
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/sebastien-jorge/rate-limiter/internal/models"
+	"github.com/sebastien-jorge/rate-limiter/internal/storage"
 )
+
+func newTestLimiter(t *testing.T) *RateLimiter {
+	t.Helper()
+	store := storage.NewMemoryStore()
+	t.Cleanup(func() { store.Close() })
+	return NewRateLimiter(store)
+}
 
 func testPolicy(route, method string, limit int64) *models.RoutePolicy {
 	return &models.RoutePolicy{
@@ -24,10 +32,10 @@ func testPolicy(route, method string, limit int64) *models.RoutePolicy {
 }
 
 func TestRateLimiter_Check_AllowsFirstRequest(t *testing.T) {
-	rl := NewRateLimiter()
+	rl := newTestLimiter(t)
 	policy := testPolicy("/api", "GET", 10)
 
-	d := rl.Check("client-a", policy, "global")
+	d := rl.Check(context.Background(), "client-a", policy, "global")
 	assert.True(t, d.Allowed)
 	assert.Equal(t, int64(9), d.Remaining)
 	assert.Zero(t, d.RetryAfter)
@@ -35,13 +43,14 @@ func TestRateLimiter_Check_AllowsFirstRequest(t *testing.T) {
 }
 
 func TestRateLimiter_Check_DeniesAfterLimit(t *testing.T) {
-	rl := NewRateLimiter()
+	rl := newTestLimiter(t)
 	policy := testPolicy("/api", "GET", 2)
+	ctx := context.Background()
 
-	rl.Check("client", policy, "id")
-	rl.Check("client", policy, "id")
+	rl.Check(ctx, "client", policy, "id")
+	rl.Check(ctx, "client", policy, "id")
 
-	d := rl.Check("client", policy, "id")
+	d := rl.Check(ctx, "client", policy, "id")
 	assert.False(t, d.Allowed)
 	assert.Equal(t, int64(0), d.Remaining)
 	assert.Positive(t, d.RetryAfter)
@@ -49,11 +58,12 @@ func TestRateLimiter_Check_DeniesAfterLimit(t *testing.T) {
 }
 
 func TestRateLimiter_Check_EmptyIdentifierUsesGlobal(t *testing.T) {
-	rl := NewRateLimiter()
+	rl := newTestLimiter(t)
 	policy := testPolicy("/api", "GET", 5)
+	ctx := context.Background()
 
-	d1 := rl.Check("c", policy, "")
-	d2 := rl.Check("c", policy, "")
+	d1 := rl.Check(ctx, "c", policy, "")
+	d2 := rl.Check(ctx, "c", policy, "")
 	assert.True(t, d1.Allowed)
 	assert.True(t, d2.Allowed)
 	// Both calls must decrement the same bucket.
@@ -62,50 +72,21 @@ func TestRateLimiter_Check_EmptyIdentifierUsesGlobal(t *testing.T) {
 }
 
 func TestRateLimiter_Check_SeparateBucketsPerIdentifier(t *testing.T) {
-	rl := NewRateLimiter()
+	rl := newTestLimiter(t)
 	policy := testPolicy("/api", "GET", 1)
+	ctx := context.Background()
 
-	d1 := rl.Check("c", policy, "user-A")
-	d2 := rl.Check("c", policy, "user-B")
+	d1 := rl.Check(ctx, "c", policy, "user-A")
+	d2 := rl.Check(ctx, "c", policy, "user-B")
 	assert.True(t, d1.Allowed)
 	assert.True(t, d2.Allowed)
 }
 
-func TestRateLimiter_GetStats_ReturnsRemaining(t *testing.T) {
-	rl := NewRateLimiter()
-	policy := testPolicy("/api", "GET", 10)
-	rl.Check("c", policy, "u")
-
-	stats := rl.GetStats()
-	require.Len(t, stats, 1)
-	for _, remaining := range stats {
-		assert.Equal(t, int64(9), remaining)
-	}
-}
-
-func TestRateLimiter_GetStats_EmptyWhenNoBuckets(t *testing.T) {
-	rl := NewRateLimiter()
-	assert.Empty(t, rl.GetStats())
-}
-
-func TestRateLimiter_Reset_ClearsBuckets(t *testing.T) {
-	rl := NewRateLimiter()
-	policy := testPolicy("/api", "GET", 5)
-	rl.Check("c", policy, "u")
-
-	rl.Reset()
-	assert.Empty(t, rl.GetStats())
-
-	// Bucket should be recreated fresh after reset.
-	d := rl.Check("c", policy, "u")
-	assert.True(t, d.Allowed)
-	assert.Equal(t, int64(4), d.Remaining)
-}
-
 func TestRateLimiter_Check_ConcurrentSameBucket(t *testing.T) {
 	const limit = 100
-	rl := NewRateLimiter()
+	rl := newTestLimiter(t)
 	policy := testPolicy("/api", "GET", limit)
+	ctx := context.Background()
 
 	var (
 		wg      sync.WaitGroup
@@ -115,7 +96,7 @@ func TestRateLimiter_Check_ConcurrentSameBucket(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d := rl.Check("c", policy, "shared")
+			d := rl.Check(ctx, "c", policy, "shared")
 			if d.Allowed {
 				allowed.Add(1)
 			}
@@ -127,8 +108,9 @@ func TestRateLimiter_Check_ConcurrentSameBucket(t *testing.T) {
 }
 
 func TestRateLimiter_Check_ConcurrentDifferentBuckets(t *testing.T) {
-	rl := NewRateLimiter()
+	rl := newTestLimiter(t)
 	policy := testPolicy("/api", "GET", 1)
+	ctx := context.Background()
 
 	var wg sync.WaitGroup
 	for i := range 50 {
@@ -136,7 +118,7 @@ func TestRateLimiter_Check_ConcurrentDifferentBuckets(t *testing.T) {
 		id := string(rune('A' + i))
 		go func(identifier string) {
 			defer wg.Done()
-			d := rl.Check("c", policy, identifier)
+			d := rl.Check(ctx, "c", policy, identifier)
 			assert.True(t, d.Allowed, "each unique identifier should have its own bucket")
 		}(id)
 	}
@@ -144,9 +126,9 @@ func TestRateLimiter_Check_ConcurrentDifferentBuckets(t *testing.T) {
 }
 
 func TestRateLimiter_ResetTime_IsSet(t *testing.T) {
-	rl := NewRateLimiter()
+	rl := newTestLimiter(t)
 	policy := testPolicy("/api", "GET", 10)
 
-	d := rl.Check("c", policy, "u")
+	d := rl.Check(context.Background(), "c", policy, "u")
 	assert.False(t, d.ResetTime.IsZero())
 }

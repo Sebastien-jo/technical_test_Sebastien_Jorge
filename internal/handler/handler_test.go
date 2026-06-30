@@ -24,26 +24,21 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
-// failingStore is a Store stub whose Health() always returns an error.
+// failingStore is a Store stub whose every operation fails. Used to drive the
+// degraded-storage code paths in the handler.
 type failingStore struct{}
 
-func (f *failingStore) Set(_ context.Context, _ string, _ int64, _ time.Duration) error {
-	return nil
+func (f *failingStore) Clear(_ context.Context) error  { return nil }
+func (f *failingStore) Health(_ context.Context) error { return errors.New("storage unavailable") }
+func (f *failingStore) CheckTokenBucket(_ context.Context, _ string, _ int64, _ float64, _ time.Duration) (storage.BucketResult, error) {
+	return storage.BucketResult{}, errors.New("storage unavailable")
 }
-func (f *failingStore) Get(_ context.Context, _ string) (int64, error)               { return 0, nil }
-func (f *failingStore) Increment(_ context.Context, _ string, _ int64, _ time.Duration) (int64, error) {
-	return 0, nil
-}
-func (f *failingStore) Delete(_ context.Context, _ string) error          { return nil }
-func (f *failingStore) Exists(_ context.Context, _ string) (bool, error)  { return false, nil }
-func (f *failingStore) Clear(_ context.Context) error                     { return nil }
-func (f *failingStore) Health(_ context.Context) error                    { return errors.New("storage unavailable") }
 
 // setupRouter builds a test router wired with the given policies.
 func setupRouter(policies []*models.ClientPolicy) *gin.Engine {
-	rl := service.NewRateLimiter()
-	pm := service.NewPolicyMatcher(policies)
 	store := storage.NewMemoryStore()
+	rl := service.NewRateLimiter(store)
+	pm := service.NewPolicyMatcher(policies)
 	h := handler.New(rl, pm, store, observability.NewNoopMetrics())
 
 	r := gin.New()
@@ -296,9 +291,10 @@ func TestCheck_IdentifierNone(t *testing.T) {
 }
 
 func TestHealth_Degraded(t *testing.T) {
-	rl := service.NewRateLimiter()
+	failing := &failingStore{}
+	rl := service.NewRateLimiter(failing)
 	pm := service.NewPolicyMatcher(nil)
-	h := handler.New(rl, pm, &failingStore{}, observability.NewNoopMetrics())
+	h := handler.New(rl, pm, failing, observability.NewNoopMetrics())
 
 	r := gin.New()
 	r.Use(handler.RequestID())
@@ -316,9 +312,9 @@ func TestHealth_Degraded(t *testing.T) {
 }
 
 func TestLogger_DoesNotBreakRequests(t *testing.T) {
-	rl := service.NewRateLimiter()
-	pm := service.NewPolicyMatcher(nil)
 	store := storage.NewMemoryStore()
+	rl := service.NewRateLimiter(store)
+	pm := service.NewPolicyMatcher(nil)
 	h := handler.New(rl, pm, store, observability.NewNoopMetrics())
 
 	r := gin.New()
